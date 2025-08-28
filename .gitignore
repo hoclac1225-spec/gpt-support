@@ -1,0 +1,12 @@
+# env & secrets
+.env
+*.env
+
+# virtual env
+venv/
+ENV/
+
+# caches & misc
+__pycache__/
+*.pyc
+.DS_Store

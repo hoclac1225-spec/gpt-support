@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <title>Icon Chat Widget</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root {
+      --brand: #0d6efd;       /* màu thương hiệu xanh dương */
+      --bubble: #f3f4f6;      /* nền tin nhắn bot */
+      --radius: 16px;
+      --shadow: 0 12px 28px rgba(0,0,0,.15);
+      --z: 99999;
+      --w: 360px;
+      --h: 520px;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, Segoe UI, Arial, sans-serif; }
+  
+    /* Nút icon nổi */
+    .chat-fab {
+      position: fixed; right: 16px; bottom: 16px; z-index: var(--z);
+      width: 60px; height: 60px; border-radius: 50%;
+      border: 2px solid #e5e7eb; background: #fff; cursor: pointer;
+      display: grid; place-items: center; box-shadow: var(--shadow);
+      transition: transform .25s ease;
+    }
+    .chat-fab:hover { transform: scale(1.08); }
+    .chat-fab svg { width: 32px; height: 32px; fill: var(--brand); }
+  
+    /* Khung chat */
+    .chat-wrap {
+      position: fixed; right: 16px; bottom: 80px; z-index: var(--z);
+      width: var(--w); height: var(--h);
+      background: #fff; border: 1px solid #eee; border-radius: var(--radius);
+      overflow: hidden; box-shadow: var(--shadow); display: none;
+      animation: fadeUp .3s ease;
+    }
+    @keyframes fadeUp { from { opacity:0; transform: translateY(20px);} to{ opacity:1; transform:translateY(0);} }
+  
+    .chat-head {
+      height: 52px; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 14px; border-bottom: 1px solid #eee; background: var(--brand); color: #fff;
+    }
+    .chat-title { font-weight: 600; font-size: 15px; }
+    .chat-close { border: 0; background: transparent; font-size: 22px; cursor: pointer; color:#fff; }
+  
+    .chat-body { height: calc(100% - 52px - 72px); padding: 12px; overflow: auto; background:#fafafa; }
+    .chat-note {
+      font-size: 13px; color:#555; padding:6px 12px; border-top:1px solid #eee; background:#f9f9f9;
+      text-align:center; font-style:italic;
+    }
+    .chat-input {
+      height: 52px; display: flex; border-top: 1px solid #eee; background:#fff;
+    }
+    .chat-input input {
+      flex: 1; border: 0; outline: none; padding: 10px 12px; font-size:14px;
+    }
+    .chat-input button {
+      border: 0; padding: 0 16px; background: var(--brand); color: #fff; cursor: pointer; font-weight:600;
+      transition: background .25s;
+    }
+    .chat-input button:hover { background:#084298; }
+  
+    .bubble { margin: 8px 0; }
+    .bubble > div {
+      display: inline-block; max-width: 85%; padding: 8px 12px; border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.08);
+    }
+    .is-user { text-align: right; }
+    .is-user > div { background: var(--brand); color: #fff; }
+    .is-bot  > div { background: var(--bubble); color: #111; }
+  
+    /* Mobile: full màn hình */
+    @media (max-width: 768px) {
+      .chat-wrap {
+        width: 100vw; height: 100vh; right: 0; bottom: 0; border-radius: 0; border: 0;
+      }
+      .chat-fab { right: 12px; bottom: 12px; }
+    }
+    .chat-welcome {
+  position: fixed;
+  right: 16px;
+  bottom: 86px;       /* cách icon 1 chút */
+  background: #f7f2ed;
+  padding: 8px 12px;
+  border-radius: 10px;
+  box-shadow: 0 4px 12px rgba(0,0,0,.1);
+  font-size: 13px;
+  color: #1f351e;
+  max-width: 200px;   /* giữ 2 dòng gọn */
+  line-height: 1.0;
+  text-align: center;
+  z-index: 99999;
+}
+
+  </style>
+  
+</head>
+<body>
+
+  <!-- Icon chat (floating action button) -->
+  <div class="chat-welcome" id="chatNote">
+    Hoan nghênh bạn đến với cửa hàng,<br>
+    bạn cần gì tôi rất vui khi được phục vụ ạ.
+  </div>
+  
+  <button class="chat-fab" id="chatFab" aria-label="Mở chat">
+    <!-- icon nhân viên hỗ trợ -->
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+      <path d="M12 12c2.7 0 5-2.3 5-5s-2.3-5-5-5-5 2.3-5 5 2.3 5 5 5zm0 2c-3.3 0-10 1.7-10 5v3h20v-3c0-3.3-6.7-5-10-5z"/>
+    </svg>
+  </button>
+  
+  
+  
+
+  <!-- Hộp chat -->
+  <section class="chat-wrap" id="chatWrap" role="dialog" aria-modal="true" aria-labelledby="chatTitle">
+    <header class="chat-head">
+      <div class="chat-title" id="chatTitle">Hỗ trợ AI</div>
+      <button class="chat-close" id="chatClose" aria-label="Đóng">×</button>
+    </header>
+
+    <main class="chat-body" id="chatMsgs" tabindex="0" aria-live="polite" aria-atomic="false"></main>
+
+    <footer class="chat-input">
+      <input id="chatInput" placeholder="Nhập câu hỏi..." aria-label="Ô nhập câu hỏi" />
+      <button id="chatSend" aria-label="Gửi">Gửi</button>
+    </footer>
+  </section>
+
+  <script>
+    (function () {
+      const API_URL = 'http://127.0.0.1:3000/api/chat'; // đổi sang App Proxy khi deploy
+      const el = (s) => document.querySelector(s);
+
+      const fab   = el('#chatFab');
+      const wrap  = el('#chatWrap');
+      const close = el('#chatClose');
+      const msgs  = el('#chatMsgs');
+      const input = el('#chatInput');
+      const send  = el('#chatSend');
+
+      const bubble = (text, who='bot') =>
+        `<div class="bubble ${who==='user' ? 'is-user':'is-bot'}">
+           <div>${text.replace(/</g,'&lt;')}</div>
+         </div>`;
+
+      const open  = () => { wrap.style.display = 'block'; setTimeout(()=>input.focus(), 50); };
+      const hide  = () => { wrap.style.display = 'none'; };
+      fab.onclick   = () => wrap.style.display === 'none' ? open() : hide();
+      close.onclick = hide;
+
+      const append = (html) => { msgs.insertAdjacentHTML('beforeend', html); msgs.scrollTop = msgs.scrollHeight; };
+
+      async function ask(text) {
+        append(bubble(text,'user')); input.value = '';
+        try {
+          const r = await fetch(API_URL, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({
+              messages: [{ role:'user', content:[{ type:'input_text', text }] }]
+            })
+          });
+          const data = await r.json();
+          const answer = data?.output?.[0]?.content?.[0]?.text || 'Xin lỗi, thử lại sau.';
+          append(bubble(answer,'bot'));
+        } catch (e) {
+          append(bubble('Lỗi kết nối server.', 'bot'));
+        }
+      }
+
+      send.onclick = () => {
+        const text = input.value.trim();
+        if (text) ask(text);
+      };
+
+      input.addEventListener('keydown', (e)=> {
+        if (e.key === 'Enter') { e.preventDefault(); send.click(); }
+      });
+
+      // ESC để đóng trên desktop
+      document.addEventListener('keydown', (e)=> {
+        if (e.key === 'Escape' && wrap.style.display==='block') hide();
+      });
+    })();
+    const note = document.getElementById('chatNote');
+  const lang = navigator.language || navigator.userLanguage;
+  if(lang.startsWith('en')) {
+    note.textContent = "Welcome to our store, I'm happy to assist you!";
+  } else if(lang.startsWith('ja')) {
+    note.textContent = "私たちのショップへようこそ。喜んでお手伝いします！";
+  } else if(lang.startsWith('zh')) {
+    note.textContent = "欢迎来到我们的商店，很高兴为您服务！";
+  } else {
+    note.textContent = "Hoan nghênh bạn đến với cửa hàng, bạn cần gì tôi rất vui khi được phục vụ ạ.";
+  }
+  </script>
+</body>
+</html>
