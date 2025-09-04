@@ -10,3 +10,9 @@ ENV/
 __pycache__/
 *.pyc
 .DS_Store
+.env
+ngrok.exe
+ngrok.exe
+venv/
+__pycache__/
+data/

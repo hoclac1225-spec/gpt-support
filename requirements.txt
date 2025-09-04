@@ -3,3 +3,6 @@ flask-cors
 python-dotenv
 requests
 gunicorn
+openai>=1.40.0
+faiss-cpu
+numpy
