@@ -671,6 +671,23 @@ def auth_callback():
     code = request.args.get("code")
     print("🔁 /auth/callback code:", code)
     return f"Auth success! Code: {code}"
+@app.route("/privacy")
+def privacy():
+    return """
+    <h1>Privacy Policy - Aloha Bot</h1>
+    <p>Chúng tôi chỉ xử lý nội dung tin nhắn mà người dùng gửi tới Fanpage để trả lời.
+    Không bán/chia sẻ dữ liệu cá nhân. Dữ liệu phiên trò chuyện (session) chỉ lưu tạm thời
+    tối đa 30 phút phục vụ trả lời và sẽ tự xoá sau đó. Chỉ số sản phẩm (vectors) là dữ liệu công khai từ cửa hàng.</p>
+    <p>Liên hệ xoá dữ liệu: gửi tin nhắn 'delete my data' tới Fanpage hoặc email: <b>hoclac1225@email.com</b>.</p>
+    """, 200, {"Content-Type":"text/html; charset=utf-8"}
+
+@app.route("/data_deletion")
+def data_deletion():
+    return """
+    <h1>Data Deletion Instructions</h1>
+    <p>Để yêu cầu xoá dữ liệu: (1) nhắn 'delete my data' tới Fanpage, hoặc (2) gửi email tới <b>hoclac1225@email.com</b>
+    kèm ID cuộc trò chuyện. Chúng tôi sẽ xử lý trong thời gian sớm nhất.</p>
+    """, 200, {"Content-Type":"text/html; charset=utf-8"}
 
 # ========= Debug =========
 @app.route("/debug/rag_status")
