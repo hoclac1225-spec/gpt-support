@@ -204,7 +204,7 @@ def fb_send_buttons(user_id, text, buttons):
     r = fb_call("/me/messages", payload)
     print(f"🔘 ButtonAPI status={getattr(r,'status_code',None)}")
 
-# ========= RAG =========
+# ========= RAG (FAISS) =========
 def _safe_read_index(prefix):
     try:
         idx_path  = os.path.join(VECTOR_DIR, f"{prefix}.index")
@@ -222,6 +222,26 @@ def _safe_read_index(prefix):
 
 IDX_PROD, META_PROD = _safe_read_index("products")
 IDX_POL,  META_POL  = _safe_read_index("policies")
+
+# === Reload vectors (FAISS) ===
+def _reload_vectors():
+    global IDX_PROD, META_PROD, IDX_POL, META_POL
+    try:
+        IDX_PROD, META_PROD = _safe_read_index("products")
+        IDX_POL,  META_POL  = _safe_read_index("policies")
+        ok = (IDX_PROD is not None or IDX_POL is not None)
+        print("🔄 Reload vectors:", ok,
+              "| prod_chunks=", (len(META_PROD) if META_PROD else 0),
+              "| policy_chunks=", (len(META_POL) if META_POL else 0))
+        return ok
+    except Exception as e:
+        print("❌ reload vectors:", repr(e))
+        return False
+
+@app.post("/admin/reload_vectors")
+def admin_reload_vectors():
+    ok = _reload_vectors()
+    return jsonify({"ok": ok})
 
 def _embed_query(q: str) -> np.ndarray:
     t0 = time.time()
@@ -352,7 +372,6 @@ def t(lang: str, key: str, **kw) -> str:
     s = LANG_STRINGS[lang].get(key) or LANG_STRINGS[DEFAULT_LANG].get(key, "")
     return s.format(**kw)
 
-# —— Chào ngẫu nhiên/cute theo ngôn ngữ
 def greet_text(lang: str):
     return t(lang, "greet")
 
@@ -363,7 +382,6 @@ SYSTEM_STYLE = (
     "và hỏi lại 1 câu để làm rõ. Trình bày dễ đọc: gạch đầu dòng khi liệt kê; 1 câu chốt hành động."
 )
 
-# Few-shot giữ kiểu chào mới
 FEW_SHOT_EXAMPLES = [
     {"role":"user","content":[{"type":"input_text","text":"helo"}]},
     {"role":"assistant","content":[{"type":"input_text","text":"Xin chào 👋 Rất vui được phục vụ bạn! Bạn muốn mình giúp gì không nè? 🙂"}]},
@@ -439,14 +457,13 @@ VN_SYNONYMS = {
     "ốp lưng": ["op lung","case","cover","bumper"],
     "áo thun": ["ao thun","ao phong","tshirt","t-shirt","tee"],
     "áo phông": ["ao phong","ao thun","tshirt","t-shirt","tee"],
-    # Chinese / Thai / Indonesian (để match khi user dùng ngôn ngữ đó)
+    # Chinese / Thai / Indonesian
     "手表": ["腕表","watch","表带","钢化膜","保护壳"],
     "นาฬิกา": ["watch","สายนาฬิกา","ฟิล์มกระจก","เคส"],
     "jam tangan": ["watch","tali jam","pelindung layar","case"],
 }
 
 def _normalize_text(s: str) -> str:
-    # giữu chữ số, ascii, latin mở rộng (việt), CJK, Thai; lower-case
     return re.sub(r"[^0-9a-z\u00c0-\u024f\u1e00-\u1eff\u4e00-\u9fff\u0E00-\u0E7F ]", " ", (s or "").lower())
 
 def _query_tokens(q: str, lang: str = "vi") -> set:
@@ -454,7 +471,7 @@ def _query_tokens(q: str, lang: str = "vi") -> set:
     words = [w for w in qn.split() if len(w) > 1]
     tokens = set(words)
     for i in range(len(words) - 1):
-        tokens.add((words[i] + words[i+1]).strip())  # bigram dính liền
+        tokens.add((words[i] + words[i+1]).strip())  # bigram
 
     joined = " ".join(words)
     combo_phrases = {
@@ -467,18 +484,15 @@ def _query_tokens(q: str, lang: str = "vi") -> set:
     for phrase in combo_phrases.get(lang, []):
         if phrase in joined:
             tokens.add(_normalize_text(phrase).replace(" ", ""))
-            # bơm đồng nghĩa khi bắt được cụm chính
             for k, syns in VN_SYNONYMS.items():
                 if _normalize_text(k) in _normalize_text(phrase):
                     for s in syns:
                         tokens.add(_normalize_text(s).replace(" ", ""))
 
-    # Nếu người dùng gõ một từ đồng nghĩa cụ thể -> cũng thêm vào tokens
     for synlist in VN_SYNONYMS.values():
         for s in synlist:
             if s in joined:
                 tokens.add(_normalize_text(s).replace(" ", ""))
-
     return tokens
 
 def filter_hits_by_query(hits, q, lang="vi"):
@@ -496,7 +510,6 @@ def filter_hits_by_query(hits, q, lang="vi"):
     return kept
 
 def should_relax_filter(q: str, hits: list) -> bool:
-    """Cho phép nới lỏng nếu câu quá ngắn nhưng vector-score có hit."""
     qn = _normalize_text(q)
     return len(qn.split()) <= 2 and len(hits) > 0
 
@@ -539,7 +552,7 @@ def compose_product_info(hits, lang: str = "vi"):
 
 def compose_contextual_answer(context, question, history):
     msgs = build_messages(SYSTEM_STYLE, history, context, question)
-    _, reply = call_openai(msgs, temperature=0.6)  # policy/FAQ -> chắc thông tin
+    _, reply = call_openai(msgs, temperature=0.6)
     return reply
 
 def answer_with_rag(user_id, user_question):
@@ -550,16 +563,13 @@ def answer_with_rag(user_id, user_question):
     lang = detect_lang(user_question)
     print(f"🔎 intent={intent} | 🗣️ lang={lang}")
 
-    # 1) Chào hỏi
     if intent == "greet":
         return (greet_text(lang)), []
 
-    # 2) Mời vào web tham quan
     if intent == "browse":
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
         return (t(lang, "browse", url=url)), []
 
-    # Tìm sản phẩm/ctx
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
     best = max(prod_scores or [0.0])
 
@@ -571,31 +581,26 @@ def answer_with_rag(user_id, user_question):
     print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}")
     context = retrieve_context(user_question, topk=6)
 
-    # 3) Chính sách → trả lời theo context
     if intent == "policy" and context:
         ans = compose_contextual_answer(context, user_question, hist)
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
 
-    # 4) Hỏi sản phẩm nhưng không đủ match → OOS
     if intent in {"product","product_info","other"}:
         if not filtered_hits or best < SCORE_MIN:
             url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
             return (t(lang, "oos", url=url)), []
 
-    # 5) Có hit tốt:
     if intent == "product_info":
         return compose_product_info(filtered_hits, lang=lang), filtered_hits[:1]
 
     if intent in {"product","other"} and filtered_hits and best >= SCORE_MIN:
         return compose_product_reply(filtered_hits, lang=lang), filtered_hits[:2]
 
-    # 6) Nếu còn context (mô tả/policy/faq) → dùng OpenAI
     if context:
         ans = compose_contextual_answer(context, user_question, hist)
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
 
-    # fallback
     return (t(lang, "fallback")), []
 
 # ========= API =========
@@ -616,6 +621,26 @@ def chat_rag():
         return jsonify({"error": "Missing 'question'"}), 400
     reply, _ = answer_with_rag("anonymous", q)
     return jsonify({"reply": reply})
+
+@app.route("/api/product_search")
+def api_product_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "msg": "missing q"}), 400
+
+    lang = detect_lang(q)
+    hits, scores = search_products_with_scores(q, topk=8)
+    best = max(scores or [0.0])
+    kept = filter_hits_by_query(hits, q, lang=lang) if STRICT_MATCH else hits
+    if STRICT_MATCH and not kept and should_relax_filter(q, hits):
+        kept = hits
+
+    if not kept or best < SCORE_MIN:
+        url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
+        return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
+
+    reply = compose_product_reply(kept, lang=lang)
+    return jsonify({"ok": True, "reply": reply, "items": kept[:2]})
 
 # ========= WEBHOOK FB/IG =========
 @app.route("/webhook", methods=["GET", "POST"])
@@ -652,7 +677,6 @@ def webhook():
 
                 fb_send_text(user_id, reply)
 
-                # Gửi nút khi thật sự là gợi ý sản phẩm
                 if btn_hits:
                     buttons = []
                     for h in btn_hits[:2]:
@@ -665,12 +689,13 @@ def webhook():
 
     return "ok", 200
 
-# ========= IG OAuth callback =========
+# ========= IG OAuth callback & policy pages =========
 @app.route("/auth/callback")
 def auth_callback():
     code = request.args.get("code")
     print("🔁 /auth/callback code:", code)
     return f"Auth success! Code: {code}"
+
 @app.route("/privacy")
 def privacy():
     return """
@@ -689,7 +714,7 @@ def data_deletion():
     kèm ID cuộc trò chuyện. Chúng tôi sẽ xử lý trong thời gian sớm nhất.</p>
     """, 200, {"Content-Type":"text/html; charset=utf-8"}
 
-# ========= Debug =========
+# ========= Debug & Health =========
 @app.route("/debug/rag_status")
 def rag_status():
     return jsonify({
@@ -701,12 +726,51 @@ def rag_status():
         "sessions": len(SESS),
     })
 
-@app.route("/debug/ping")
-def ping():
-    return jsonify({"ok": True})
+@app.get("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "vectors": {
+            "products": len(META_PROD) if META_PROD else 0,
+            "policies": len(META_POL) if META_POL else 0
+        }
+    })
+
+# ========= Watcher: tự reload khi vector đổi =========
+from apscheduler.schedulers.background import BackgroundScheduler
+
+_last_vec_mtime = 0
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except Exception:
+        return 0
+
+def _watch_vectors():
+    global _last_vec_mtime
+    idx_p = os.path.join(VECTOR_DIR, "products.index")
+    meta_p = os.path.join(VECTOR_DIR, "products.meta.json")
+    idx_k = os.path.join(VECTOR_DIR, "policies.index")
+    meta_k = os.path.join(VECTOR_DIR, "policies.meta.json")
+
+    newest = max(_mtime(idx_p), _mtime(meta_p), _mtime(idx_k), _mtime(meta_k))
+    if newest and newest != _last_vec_mtime:
+        print("🕵️ Detected vector change → reload")
+        if _reload_vectors():
+            _last_vec_mtime = newest
+
+def _start_vector_watcher():
+    try:
+        sch = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
+        sch.add_job(_watch_vectors, "interval", seconds=30, id="watch_vectors")
+        sch.start()
+        print("⏱️ Vector watcher started (30s)")
+    except Exception as e:
+        print("⚠️ Scheduler error:", repr(e))
 
 # ========= MAIN =========
 if __name__ == "__main__":
+    _start_vector_watcher()
     port = int(os.getenv("PORT", 3000))
     print(f"🚀 Starting app on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)

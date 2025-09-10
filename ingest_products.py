@@ -10,10 +10,10 @@ from urllib.parse import urlparse, parse_qs, quote
 load_dotenv()
 
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
-STORE            = os.getenv("SHOPIFY_STORE", "")              # ví dụ: 9mn9fa-6p.myshopify.com
+STORE            = os.getenv("SHOPIFY_STORE", "")              # ví dụ: xxx.myshopify.com
 TOKEN            = os.getenv("SHOPIFY_ADMIN_API_TOKEN", "")
 VECTOR_DIR       = os.getenv("VECTOR_DIR", "./vectors")
-SHOP_FRONT_URL   = os.getenv("SHOP_FRONT_URL", "")             # ví dụ: https://shop.aloha.id.vn (tùy chọn)
+SHOP_FRONT_URL   = os.getenv("SHOP_FRONT_URL", "")             # ví dụ: https://shop.aloha.id.vn
 FETCH_METAFIELDS = os.getenv("FETCH_METAFIELDS", "false").lower() == "true"
 EMBED_MODEL      = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # khớp app.py
 EMBED_BATCH      = int(os.getenv("EMBED_BATCH", "128"))
