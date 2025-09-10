@@ -1,8 +1,12 @@
 flask
+gunicorn
 flask-cors
 python-dotenv
+openai
 requests
-gunicorn
-openai>=1.40.0
-faiss-cpu
 numpy
+faiss-cpu
+apscheduler
+APScheduler==3.10.4
+
+
