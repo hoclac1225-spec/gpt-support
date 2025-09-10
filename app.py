@@ -767,13 +767,7 @@ def _start_vector_watcher():
         print("⏱️ Vector watcher started (30s)")
     except Exception as e:
         print("⚠️ Scheduler error:", repr(e))
-
-# ========= MAIN =========
-if __name__ == "__main__":
-    _start_vector_watcher()
-    port = int(os.getenv("PORT", 3000))
-    print(f"🚀 Starting app on 0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+# ========= HEALTH CHECK =========
 @app.route("/health")
 def health():
     return jsonify({
@@ -781,3 +775,11 @@ def health():
         "products": len(META_PROD) if META_PROD else 0,
         "policies": len(META_POL) if META_POL else 0
     })
+
+# ======== MAIN ========
+if __name__ == "__main__":
+    _start_vector_watcher()
+    port = int(os.getenv("PORT", 3000))
+    print(f"🚀 Starting app on 0.0.0.0:{port}")
+    # app.run(host="0.0.0.0", port=port, debug=False)  # khi chạy local
+
