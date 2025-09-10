@@ -774,3 +774,10 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
     print(f"🚀 Starting app on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+@app.route("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "products": len(META_PROD) if META_PROD else 0,
+        "policies": len(META_POL) if META_POL else 0
+    })
