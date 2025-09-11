@@ -1,4 +1,4 @@
-
+﻿
 # -*- coding: utf-8 -*-
 import unicodedata
 import os, json, time, re, requests, numpy as np, faiss, threading, random
@@ -2117,5 +2117,9 @@ if __name__ == "__main__":
         _start_vector_watcher()
     port = int(os.getenv("PORT", 3000))
     print(f"🚀 Starting app on 0.0.0.0:{port}")
+
     app.run(host="0.0.0.0", port=port, debug=False)  # <— đảm bảo KHÔNG bị comment
+
+=======
+    # app.run(host="0.0.0.0", port=port, debug=False)  # khi chạy local
 
