@@ -39,9 +39,7 @@ print("TOKEN_MAP size:", len(TOKEN_MAP))
 
 VECTOR_DIR       = os.getenv("VECTOR_DIR", "./vectors")
 # Shopify
-SHOPIFY_SHOP            = os.getenv("SHOP_URL", "")  # optional, chỉ để tham chiếu
-SHOPIFY_WEBHOOK_SECRET = (os.getenv("SHOPIFY_WEBHOOK_SECRET", "") or "").strip()
-
+SHOPIFY_SHOP = os.getenv("SHOPIFY_STORE", "")  # domain *.myshopify.com (tham chiếu)
 # Link shop mặc định (fallback)
 SHOP_URL         = os.getenv("SHOP_URL", "https://shop.aloha.id.vn/zh")
 # Đa ngôn ngữ
@@ -64,8 +62,9 @@ STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
 
 print("=== BOOT ===")
 print("VECTOR_DIR:", os.path.abspath(VECTOR_DIR))
-print("TOKEN_MAP size:", len(TOKEN_MAP))   # dùng TOKEN_MAP, không phải PAGE_MAP
+print("TOKEN_MAP size:", len(TOKEN_MAP))
 print("OPENAI key set:", bool(OPENAI_API_KEY))
+
 
 # OpenAI
 OPENAI_URL   = "https://api.openai.com/v1/responses"
@@ -671,9 +670,51 @@ def webhook():
             elif event.get("postback", {}).get("payload"):
                 psid = event["sender"]["id"]
                 fb_send_text(psid, f"Bạn vừa chọn: {event['postback']['payload']}", access_token)
+            # quick reply payload (nếu dùng quick_replies)
+            elif event.get("message", {}).get("quick_reply", {}).get("payload"):
+                psid = event["sender"]["id"]
+                qr_payload = event["message"]["quick_reply"]["payload"]
+                fb_send_text(psid, f"Bạn vừa chọn: {qr_payload}", access_token)
+
 
     return "ok", 200
 
+
+# ========= API =========
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    data = request.json or {}
+    messages = data.get("messages", [])
+    print("🌐 /api/chat len =", len(messages))
+    openai_raw, _ = call_openai(messages)
+    return jsonify(openai_raw)
+
+@app.route("/api/chat_rag", methods=["POST"])
+def chat_rag():
+    data = request.json or {}
+    q = data.get("question", "")
+    print("🌐 /api/chat_rag question:", q)
+    if not q:
+        return jsonify({"error": "Missing 'question'"}), 400
+    reply, _ = answer_with_rag("anonymous", q)
+    return jsonify({"reply": reply})
+
+@app.route("/api/product_search")
+def api_product_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "msg": "missing q"}), 400
+    lang = detect_lang(q)
+    hits, scores = search_products_with_scores(q, topk=8)
+    best = max(scores or [0.0])
+    kept = filter_hits_by_query(hits, q, lang=lang) if STRICT_MATCH else hits
+    if STRICT_MATCH and not kept and should_relax_filter(q, hits):
+        kept = hits
+    if not kept or best < SCORE_MIN:
+        url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
+        return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
+    reply = compose_product_reply(kept, lang=lang)
+    return jsonify({"ok": True, "reply": reply, "items": kept[:2]})
 
 # ========= IG OAuth callback & policy pages =========
 @app.route("/auth/callback")
