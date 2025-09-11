@@ -1,11 +1,13 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import unicodedata
 import os, json, time, re, requests, numpy as np, faiss, threading, random
 from collections import deque
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
 from dotenv import load_dotenv
 from openai import OpenAI
+import hmac, hashlib, base64
+
 
 # ========= BOOTSTRAP =========
 load_dotenv()
@@ -19,6 +21,10 @@ OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "aloha_verify_123")
 FB_PAGE_TOKEN    = os.getenv("FB_PAGE_TOKEN", "")
 VECTOR_DIR       = os.getenv("VECTOR_DIR", "./vectors")
+# Shopify
+SHOPIFY_SHOP            = os.getenv("SHOP_URL", "")  # optional, chỉ để tham chiếu
+SHOPIFY_WEBHOOK_SECRET  = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")  # để verify HMAC
+
 
 # Link shop mặc định (fallback)
 SHOP_URL         = os.getenv("SHOP_URL", "https://shop.aloha.id.vn/zh")
@@ -688,6 +694,46 @@ def webhook():
                         fb_send_buttons(user_id, "Xem nhanh:", buttons)
 
     return "ok", 200
+# ========= WEBHOOK SHOPIFY =========
+@app.post("/webhook/shopify")
+def webhook_shopify():
+    """
+    Shopify gửi webhook tới đây. Verify HMAC bằng SHOPIFY_WEBHOOK_SECRET,
+    nếu sai trả 401; đúng thì trả 200.
+    """
+    # 1) Verify HMAC
+    if not SHOPIFY_WEBHOOK_SECRET:
+        print("⚠️ Missing SHOPIFY_WEBHOOK_SECRET env")
+        abort(401)
+
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+    try:
+        digest = hmac.new(
+            SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
+            request.data,
+            hashlib.sha256
+        ).digest()
+        expected = base64.b64encode(digest).decode("utf-8")
+    except Exception as e:
+        print("⚠️ HMAC build error:", repr(e))
+        abort(401)
+
+    if not hmac.compare_digest(expected, hmac_header or ""):
+        print("❌ HMAC verification failed")
+        abort(401)
+
+    # 2) Đọc topic & payload
+    topic = request.headers.get("X-Shopify-Topic", "")
+    shop  = request.headers.get("X-Shopify-Shop-Domain", "")
+    payload = request.get_json(silent=True) or {}
+
+    print(f"✅ Shopify webhook: topic={topic} | shop={shop}")
+    # TODO: tuỳ biến xử lý theo topic
+    # if topic == "orders/create": ...
+    # elif topic == "products/update": ...
+    # elif topic == "inventory_levels/update": ...
+
+    return ("OK", 200)
 
 # ========= IG OAuth callback & policy pages =========
 @app.route("/auth/callback")
@@ -772,4 +818,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 3000))
     print(f"🚀 Starting app on 0.0.0.0:{port}")
     # app.run(host="0.0.0.0", port=port, debug=False)  # khi chạy local
-
