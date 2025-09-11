@@ -23,8 +23,7 @@ FB_PAGE_TOKEN    = os.getenv("FB_PAGE_TOKEN", "")
 VECTOR_DIR       = os.getenv("VECTOR_DIR", "./vectors")
 # Shopify
 SHOPIFY_SHOP            = os.getenv("SHOP_URL", "")  # optional, chỉ để tham chiếu
-SHOPIFY_WEBHOOK_SECRET  = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")  # để verify HMAC
-
+SHOPIFY_WEBHOOK_SECRET = (os.getenv("SHOPIFY_WEBHOOK_SECRET", "") or "").strip()
 
 # Link shop mặc định (fallback)
 SHOP_URL         = os.getenv("SHOP_URL", "https://shop.aloha.id.vn/zh")
@@ -697,17 +696,18 @@ def webhook():
 # ========= WEBHOOK SHOPIFY =========
 @app.post("/webhook/shopify")
 def webhook_shopify():
-    """
-    Shopify gửi webhook tới đây. Verify HMAC bằng SHOPIFY_WEBHOOK_SECRET,
-    nếu sai trả 401; đúng thì trả 200.
-    """
     if not SHOPIFY_WEBHOOK_SECRET:
         print("⚠️ Missing SHOPIFY_WEBHOOK_SECRET env")
         abort(401)
 
-    # Lấy raw body đúng như Shopify gửi (bytes)
-    raw_body = request.get_data(cache=True, as_text=False)  # giữ cache để lát nữa còn parse JSON
-    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "") or ""
+    # Lấy body thô (bytes) - GIỮ cache để parse JSON sau
+    raw_body = request.get_data(cache=True, as_text=False)  # bytes
+
+    # Đọc header chữ hoa hoặc chữ thường
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256") \
+                  or request.headers.get("x-shopify-hmac-sha256") \
+                  or ""
+    hmac_header = hmac_header.strip()
 
     try:
         digest = hmac.new(
@@ -721,17 +721,17 @@ def webhook_shopify():
         abort(401)
 
     if not hmac.compare_digest(expected, hmac_header):
-        print(f"❌ HMAC verification failed | got={hmac_header[:12]}... | exp={expected[:12]}... | len={len(raw_body)}")
+        print(f"❌ HMAC verification failed"
+              f" | got={hmac_header}"
+              f" | exp={expected}"
+              f" | len={len(raw_body)}"
+              f" | secret_len={len(SHOPIFY_WEBHOOK_SECRET)}")
         abort(401)
 
-    # Đúng HMAC rồi mới đọc headers/payload
     topic = request.headers.get("X-Shopify-Topic", "")
     shop  = request.headers.get("X-Shopify-Shop-Domain", "")
-    # Có thể parse từ cache (Flask vẫn giữ body) hoặc tự parse từ raw_body:
     payload = request.get_json(silent=True) or {}
-
-    print(f"✅ Shopify webhook: topic={topic} | shop={shop}")
-    # TODO: xử lý theo topic...
+    print(f"✅ Shopify webhook OK | topic={topic} | shop={shop} | len={len(raw_body)}")
     return ("OK", 200)
 
 
