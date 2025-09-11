@@ -701,16 +701,18 @@ def webhook_shopify():
     Shopify gửi webhook tới đây. Verify HMAC bằng SHOPIFY_WEBHOOK_SECRET,
     nếu sai trả 401; đúng thì trả 200.
     """
-    # 1) Verify HMAC
     if not SHOPIFY_WEBHOOK_SECRET:
         print("⚠️ Missing SHOPIFY_WEBHOOK_SECRET env")
         abort(401)
 
-    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+    # Lấy raw body đúng như Shopify gửi (bytes)
+    raw_body = request.get_data(cache=True, as_text=False)  # giữ cache để lát nữa còn parse JSON
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "") or ""
+
     try:
         digest = hmac.new(
             SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
-            request.data,
+            raw_body,
             hashlib.sha256
         ).digest()
         expected = base64.b64encode(digest).decode("utf-8")
@@ -718,22 +720,20 @@ def webhook_shopify():
         print("⚠️ HMAC build error:", repr(e))
         abort(401)
 
-    if not hmac.compare_digest(expected, hmac_header or ""):
-        print("❌ HMAC verification failed")
+    if not hmac.compare_digest(expected, hmac_header):
+        print(f"❌ HMAC verification failed | got={hmac_header[:12]}... | exp={expected[:12]}... | len={len(raw_body)}")
         abort(401)
 
-    # 2) Đọc topic & payload
+    # Đúng HMAC rồi mới đọc headers/payload
     topic = request.headers.get("X-Shopify-Topic", "")
     shop  = request.headers.get("X-Shopify-Shop-Domain", "")
+    # Có thể parse từ cache (Flask vẫn giữ body) hoặc tự parse từ raw_body:
     payload = request.get_json(silent=True) or {}
 
     print(f"✅ Shopify webhook: topic={topic} | shop={shop}")
-    # TODO: tuỳ biến xử lý theo topic
-    # if topic == "orders/create": ...
-    # elif topic == "products/update": ...
-    # elif topic == "inventory_levels/update": ...
-
+    # TODO: xử lý theo topic...
     return ("OK", 200)
+
 
 # ========= IG OAuth callback & policy pages =========
 @app.route("/auth/callback")
