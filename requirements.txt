@@ -6,7 +6,6 @@ openai
 requests
 numpy
 faiss-cpu
-apscheduler
 APScheduler==3.10.4
 
 
