@@ -19,7 +19,24 @@ CORS(app, origins=origins)
 
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "aloha_verify_123")
-FB_PAGE_TOKEN    = os.getenv("FB_PAGE_TOKEN", "")
+# ---- Multi-page map ----
+# ---- Multi-id -> token (FB Page & IG) ----
+TOKEN_MAP = {}
+
+def _add_map(key, token):
+    if key and token:
+        TOKEN_MAP[str(key)] = token
+
+for i in range(1, 11):
+    pid = os.getenv(f"FB_PAGE_ID_{i}")
+    ptk = os.getenv(f"FB_PAGE_TOKEN_{i}")
+    _add_map(pid, ptk)  # map Page ID -> Page token
+
+    igid = os.getenv(f"IG_ACCOUNT_ID_{i}")
+    _add_map(igid, ptk) # map IG Account ID -> dùng CHUNG Page token đã liên kết IG
+print("TOKEN_MAP size:", len(TOKEN_MAP))
+
+
 VECTOR_DIR       = os.getenv("VECTOR_DIR", "./vectors")
 # Shopify
 SHOPIFY_SHOP            = os.getenv("SHOP_URL", "")  # optional, chỉ để tham chiếu
@@ -47,13 +64,14 @@ STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
 
 print("=== BOOT ===")
 print("VECTOR_DIR:", os.path.abspath(VECTOR_DIR))
-print("FB_PAGE_TOKEN set:", bool(FB_PAGE_TOKEN))
-print("OPENAI key set:",  bool(OPENAI_API_KEY))
+print("TOKEN_MAP size:", len(TOKEN_MAP))   # dùng TOKEN_MAP, không phải PAGE_MAP
+print("OPENAI key set:", bool(OPENAI_API_KEY))
 
 # OpenAI
 OPENAI_URL   = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = "gpt-4o-mini"
-EMBED_MODEL  = "text-embedding-3-small"
+EMBED_MODEL  = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+
 oai_client   = OpenAI(api_key=OPENAI_API_KEY)
 
 # ========= SMALL IN-MEMORY SESSION =========
@@ -169,13 +187,13 @@ def rephrase_casual(text: str, intent="generic", temperature=0.7, lang: str = No
         return text + em(intent,1)
 
 # ========= FACEBOOK SENDER =========
-def fb_call(path, payload=None, method="POST", params=None):
-    if not FB_PAGE_TOKEN:
-        print("❌ FB_PAGE_TOKEN chưa cấu hình trong .env")
+def fb_call(path, payload=None, method="POST", params=None, page_token=None):
+    if not page_token:
+        print("❌ missing page_token for fb_call")
         return None
     url = f"https://graph.facebook.com/v19.0{path}"
     params = params or {}
-    params["access_token"] = FB_PAGE_TOKEN
+    params["access_token"] = page_token
     try:
         r = requests.request(method, url, params=params, json=payload, timeout=15)
         return r
@@ -183,31 +201,27 @@ def fb_call(path, payload=None, method="POST", params=None):
         print("⚠️ FB API error:", repr(e))
         return None
 
-def fb_mark_seen(user_id):
-    fb_call("/me/messages", {"recipient":{"id":user_id}, "sender_action":"mark_seen"})
+def fb_mark_seen(user_id, page_token):
+    fb_call("/me/messages", {"recipient":{"id":user_id}, "sender_action":"mark_seen"}, page_token=page_token)
 
-def fb_typing_on(user_id):
-    fb_call("/me/messages", {"recipient":{"id":user_id}, "sender_action":"typing_on"})
+def fb_typing_on(user_id, page_token):
+    fb_call("/me/messages", {"recipient":{"id":user_id}, "sender_action":"typing_on"}, page_token=page_token)
 
-def fb_send_text(user_id, text):
-    r = fb_call("/me/messages", {"recipient":{"id":user_id}, "message":{"text":text}})
+def fb_send_text(user_id, text, page_token):
+    r = fb_call("/me/messages", {"recipient":{"id":user_id}, "message":{"text":text}}, page_token=page_token)
     print(f"📩 Send text status={getattr(r, 'status_code', None)}")
 
-def fb_send_buttons(user_id, text, buttons):
-    """buttons: [{"type":"web_url","url":"https://...","title":"Xem sản phẩm"}]"""
-    if not buttons:
-        return
+def fb_send_buttons(user_id, text, buttons, page_token):
+    if not buttons: return
     payload = {
         "recipient": {"id": user_id},
         "message": {
-            "attachment": {
-                "type": "template",
-                "payload": {"template_type": "button", "text": text, "buttons": buttons[:2]}
-            }
+            "attachment": {"type": "template","payload": {"template_type": "button","text": text,"buttons": buttons[:2]}}
         }
     }
-    r = fb_call("/me/messages", payload)
+    r = fb_call("/me/messages", payload, page_token=page_token)
     print(f"🔘 ButtonAPI status={getattr(r,'status_code',None)}")
+
 
 # ========= RAG (FAISS) =========
 def _safe_read_index(prefix):
@@ -608,131 +622,57 @@ def answer_with_rag(user_id, user_question):
 
     return (t(lang, "fallback")), []
 
-# ========= API =========
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    data = request.json or {}
-    messages = data.get("messages", [])
-    print("🌐 /api/chat len =", len(messages))
-    openai_raw, _ = call_openai(messages)
-    return jsonify(openai_raw)
-
-@app.route("/api/chat_rag", methods=["POST"])
-def chat_rag():
-    data = request.json or {}
-    q = data.get("question", "")
-    print("🌐 /api/chat_rag question:", q)
-    if not q:
-        return jsonify({"error": "Missing 'question'"}), 400
-    reply, _ = answer_with_rag("anonymous", q)
-    return jsonify({"reply": reply})
-
-@app.route("/api/product_search")
-def api_product_search():
-    q = (request.args.get("q") or "").strip()
-    if not q:
-        return jsonify({"ok": False, "msg": "missing q"}), 400
-
-    lang = detect_lang(q)
-    hits, scores = search_products_with_scores(q, topk=8)
-    best = max(scores or [0.0])
-    kept = filter_hits_by_query(hits, q, lang=lang) if STRICT_MATCH else hits
-    if STRICT_MATCH and not kept and should_relax_filter(q, hits):
-        kept = hits
-
-    if not kept or best < SCORE_MIN:
-        url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
-        return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
-
-    reply = compose_product_reply(kept, lang=lang)
-    return jsonify({"ok": True, "reply": reply, "items": kept[:2]})
-
-# ========= WEBHOOK FB/IG =========
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        ok = (token == VERIFY_TOKEN)
-        print("🔐 Webhook verify:", ok)
-        return (challenge, 200) if ok else ("Invalid verification token", 403)
+        return (challenge, 200) if token == VERIFY_TOKEN else ("Invalid verification token", 403)
 
     payload = request.json or {}
-    print("📥 Incoming webhook:", json.dumps(payload, ensure_ascii=False))
 
     for entry in payload.get("entry", []):
-        for event in entry.get("messaging", []):
-            if event.get("message") and "text" in event["message"]:
-                user_id = event["sender"]["id"]
-                user_text = event["message"]["text"]
-                mid      = event["message"].get("mid")
+        owner_id = str(entry.get("id"))           # Page ID hoặc IG Account ID
+        access_token = TOKEN_MAP.get(owner_id)
+        if not access_token:
+            print("⚠️ No token mapped for:", owner_id); 
+            continue
 
-                sess = _get_sess(user_id)
-                if mid and sess["last_mid"] == mid:
-                    print("↩️ duplicate mid ignored")
+        for event in entry.get("messaging", []):
+            if event.get("message", {}).get("is_echo"):
+                continue
+            if event.get("message") and "text" in event["message"]:
+                psid = event["sender"]["id"]
+                text = event["message"]["text"]
+                mid  = event["message"].get("mid")
+
+                sess = _get_sess(psid)
+                if mid and sess["last_mid"] == mid: 
                     continue
                 sess["last_mid"] = mid
 
-                print(f"👤 From {user_id}: {user_text}")
-                fb_mark_seen(user_id); fb_typing_on(user_id)
+                fb_mark_seen(psid, access_token)
+                fb_typing_on(psid, access_token)
 
-                _remember(user_id, "user", user_text)
-                reply, btn_hits = answer_with_rag(user_id, user_text)
-                _remember(user_id, "assistant", reply)
+                _remember(psid, "user", text)
+                reply, btn_hits = answer_with_rag(psid, text)
+                _remember(psid, "assistant", reply)
 
-                fb_send_text(user_id, reply)
+                fb_send_text(psid, reply, access_token)
 
                 if btn_hits:
                     buttons = []
                     for h in btn_hits[:2]:
-                        url = h.get("url")
-                        title_btn = (h.get("title") or "Xem sản phẩm")[:20]
-                        if url:
-                            buttons.append({"type":"web_url","url":url,"title":title_btn})
+                        if h.get("url"):
+                            buttons.append({"type":"web_url","url":h["url"],"title":(h.get("title") or "Xem sản phẩm")[:20]})
                     if buttons:
-                        fb_send_buttons(user_id, "Xem nhanh:", buttons)
+                        fb_send_buttons(psid, "Xem nhanh:", buttons, access_token)
+
+            elif event.get("postback", {}).get("payload"):
+                psid = event["sender"]["id"]
+                fb_send_text(psid, f"Bạn vừa chọn: {event['postback']['payload']}", access_token)
 
     return "ok", 200
-# ========= WEBHOOK SHOPIFY =========
-@app.post("/webhook/shopify")
-def webhook_shopify():
-    if not SHOPIFY_WEBHOOK_SECRET:
-        print("⚠️ Missing SHOPIFY_WEBHOOK_SECRET env")
-        abort(401)
-
-    # Lấy body thô (bytes) - GIỮ cache để parse JSON sau
-    raw_body = request.get_data(cache=True, as_text=False)  # bytes
-
-    # Đọc header chữ hoa hoặc chữ thường
-    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256") \
-                  or request.headers.get("x-shopify-hmac-sha256") \
-                  or ""
-    hmac_header = hmac_header.strip()
-
-    try:
-        digest = hmac.new(
-            SHOPIFY_WEBHOOK_SECRET.encode("utf-8"),
-            raw_body,
-            hashlib.sha256
-        ).digest()
-        expected = base64.b64encode(digest).decode("utf-8")
-    except Exception as e:
-        print("⚠️ HMAC build error:", repr(e))
-        abort(401)
-
-    if not hmac.compare_digest(expected, hmac_header):
-        print(f"❌ HMAC verification failed"
-              f" | got={hmac_header}"
-              f" | exp={expected}"
-              f" | len={len(raw_body)}"
-              f" | secret_len={len(SHOPIFY_WEBHOOK_SECRET)}")
-        abort(401)
-
-    topic = request.headers.get("X-Shopify-Topic", "")
-    shop  = request.headers.get("X-Shopify-Shop-Domain", "")
-    payload = request.get_json(silent=True) or {}
-    print(f"✅ Shopify webhook OK | topic={topic} | shop={shop} | len={len(raw_body)}")
-    return ("OK", 200)
 
 
 # ========= IG OAuth callback & policy pages =========
