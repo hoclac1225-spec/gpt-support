@@ -704,7 +704,7 @@ def privacy():
     Không bán/chia sẻ dữ liệu cá nhân. Dữ liệu phiên trò chuyện (session) chỉ lưu tạm thời
     tối đa 30 phút phục vụ trả lời và sẽ tự xoá sau đó. Chỉ số sản phẩm (vectors) là dữ liệu công khai từ cửa hàng.</p>
     <p>Liên hệ xoá dữ liệu: gửi tin nhắn 'delete my data' tới Fanpage hoặc email: <b>hoclac1225@email.com</b>.</p>
-    """, 200, {"Content-Type":"text/html; charset=utf-8"}
+    """, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 @app.route("/data_deletion")
 def data_deletion():
@@ -712,7 +712,7 @@ def data_deletion():
     <h1>Data Deletion Instructions</h1>
     <p>Để yêu cầu xoá dữ liệu: (1) nhắn 'delete my data' tới Fanpage, hoặc (2) gửi email tới <b>hoclac1225@email.com</b>
     kèm ID cuộc trò chuyện. Chúng tôi sẽ xử lý trong thời gian sớm nhất.</p>
-    """, 200, {"Content-Type":"text/html; charset=utf-8"}
+    """, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 # ========= Debug & Health =========
 @app.route("/debug/rag_status")
@@ -726,14 +726,12 @@ def rag_status():
         "sessions": len(SESS),
     })
 
-@app.get("/health")
+@app.route("/health")
 def health():
     return jsonify({
         "ok": True,
-        "vectors": {
-            "products": len(META_PROD) if META_PROD else 0,
-            "policies": len(META_POL) if META_POL else 0
-        }
+        "products": len(META_PROD) if META_PROD else 0,
+        "policies": len(META_POL) if META_POL else 0
     })
 
 # ========= Watcher: tự reload khi vector đổi =========
@@ -767,14 +765,6 @@ def _start_vector_watcher():
         print("⏱️ Vector watcher started (30s)")
     except Exception as e:
         print("⚠️ Scheduler error:", repr(e))
-# ========= HEALTH CHECK =========
-@app.route("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "products": len(META_PROD) if META_PROD else 0,
-        "policies": len(META_POL) if META_POL else 0
-    })
 
 # ======== MAIN ========
 if __name__ == "__main__":
