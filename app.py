@@ -184,6 +184,19 @@ def rephrase_casual(text: str, intent="generic", temperature=0.7, lang: str = No
     except Exception as e:
         print("⚠️ rephrase error:", repr(e))
         return text + em(intent,1)
+def handle_smalltalk(text: str, lang: str = "vi") -> str:
+    alt = {
+        "vi": ["Hôm nay shop nhiều năng lượng lắm nè ⚡", "Vui ghê, đang ship đơn đều tay 🤝"],
+        "en": ["We’re full of energy today ⚡", "Orders are shipping steadily 🤝"],
+        "zh": ["今天精神满满 ⚡", "订单正在稳定发货中 🤝"],
+        "th": ["วันนี้ร้านไฟแรงมาก ⚡", "กำลังแพ็กของส่งเพียบเลย 🤝"],
+        "id": ["Toko lagi semangat banget hari ini ⚡", "Pesanan lagi ramai dikirim 🤝"],
+    }
+    base = [t(lang, "smalltalk_hi")] + alt.get(lang, alt["vi"])
+    follow = t(lang, "smalltalk_askback")
+    raw = f"{random.choice(base)} {follow}"
+    return rephrase_casual(raw, intent="generic", lang=lang, temperature=0.5)
+
 
 # ========= FACEBOOK SENDER =========
 def fb_call(path, payload=None, method="POST", params=None, page_token=None):
@@ -223,7 +236,9 @@ def fb_send_buttons(user_id, text, buttons, page_token):
 
 
 # ========= RAG (FAISS) =========
+
 def _safe_read_index(prefix):
+        
     try:
         idx_path  = os.path.join(VECTOR_DIR, f"{prefix}.index")
         meta_path = os.path.join(VECTOR_DIR, f"{prefix}.meta.json")
@@ -237,6 +252,7 @@ def _safe_read_index(prefix):
     except Exception as e:
         print(f"❌ Load index '{prefix}':", repr(e))
         return None, None
+
 
 IDX_PROD, META_PROD = _safe_read_index("products")
 IDX_POL,  META_POL  = _safe_read_index("policies")
@@ -310,6 +326,59 @@ def retrieve_context(question, topk=6):
             print("⚠️ search policies:", repr(e))
     print("🧠 ctx pieces:", len(ctx))
     return "\n\n".join(ctx[:topk]) if ctx else ""
+def _parse_ts(s):
+    try:
+        s = (s or "").replace("Z","").replace("T"," ")
+        return time.mktime(time.strptime(s[:19], "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return 0
+
+def get_new_arrivals(days=30, topk=4):
+    """Tìm sp mới theo timestamp/tags 'new|mới|vừa về'; fallback FAISS nếu trống."""
+    if not META_PROD:
+        return []
+    now = time.time()
+    cutoff = now - days*86400
+    new_items = []
+    for d in META_PROD:
+        ts = 0
+        for k in ("created_at","published_at","updated_at"):
+            if d.get(k):
+                ts = max(ts, _parse_ts(d.get(k)))
+        tags = (d.get("tags","") or "").lower()
+        flag_new = any(x in tags for x in ["new","mới","vừa về","new arrivals"])
+        if flag_new or (ts and ts >= cutoff):
+            new_items.append(d)
+
+    if not new_items and IDX_PROD is not None:
+        hits, _ = search_products_with_scores("new arrivals hàng mới vừa về", topk=topk*2)
+        new_items = hits
+
+    def _key(d):
+        ts = 0
+        for k in ("created_at","published_at","updated_at"):
+            ts = max(ts, _parse_ts(d.get(k)))
+        return ts
+    new_items.sort(key=_key, reverse=True)
+    return new_items[:topk]
+
+def compose_new_arrivals(lang: str = "vi", items=None):
+    items = items or []
+    if not items:
+        url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
+        return rephrase_casual(t(lang,"browse", url=url), intent="browse", lang=lang)
+    lines = []
+    for d in items[:2]:
+        title = d.get("title") or "Sản phẩm"
+        price = d.get("price")
+        stock = _stock_line(d)
+        line = f"• {title}"
+        if price: line += f" — {price} đ"
+        line += f" — {stock}"
+        lines.append(line)
+    raw = f"{t(lang,'new_hdr')}\n" + "\n".join(lines) + "\n\n" + t(lang,"product_pts")
+    return rephrase_casual(raw, intent="product", lang=lang)
+
 
 # ========= INTENT, PERSONA, FEW-SHOT & NATURAL REPLY =========
 GREETS = {"hi","hello","hey","helo","heloo","hí","hì","chào","xin chào","alo","aloha","hello bot","hi bot"}
@@ -333,65 +402,163 @@ def detect_lang(text: str) -> str:
         return "id" if "id" in SUPPORTED_LANGS else DEFAULT_LANG
     return "en" if "en" in SUPPORTED_LANGS else DEFAULT_LANG
 
+# ====== MULTI-LANG PATTERNS (smalltalk & new arrivals) ======
+# Mỗi ngôn ngữ là 1 list regex. Có thể bổ sung dần mà không đụng chỗ khác.
+# ==== Smalltalk & New arrivals (multi-lang) ====
+
+# ========= I18N STRINGS & HELPERS =========
 LANG_STRINGS = {
     "vi": {
-        "greet":      "Xin chào 👋 Rất vui được phục vụ bạn! Bạn muốn mình giúp gì không nè? 🙂",
-        "browse":     "Mời bạn vào web tham quan ạ 🛍️ 👉 {url}",
-        "oos":        "Xin lỗi 🙏 sản phẩm đó hiện **đang hết hàng** tại shop. Bạn thử xem các mẫu tương tự trên web nhé 👉 {url} ✨",
-        "fallback":   "Mình chưa đủ dữ liệu để chắc chắn 🤔. Bạn mô tả thêm mẫu/kiểu dáng/chất liệu để mình tư vấn chuẩn hơn nha ✨",
-        "suggest_hdr":"Mình đề xuất vài lựa chọn phù hợp",
-        "product_pts":"Bạn thích kiểu mảnh hay thể thao? Mình lọc thêm màu & size giúp bạn nhé.",
+        "greet": "Xin chào 👋 Rất vui được phục vụ bạn! Bạn muốn mình giúp gì không nè? 🙂",
+        "browse": "Mời bạn vào web tham quan ạ 🛍️ 👉 {url}",
+        "oos": "Xin lỗi 🙏 sản phẩm đó hiện **đang hết hàng** tại shop. Bạn thử xem các mẫu tương tự trên web nhé 👉 {url} ✨",
+        "fallback": "Mình chưa đủ dữ liệu để chắc chắn 🤔. Bạn mô tả thêm mẫu/kiểu dáng/chất liệu để mình tư vấn chuẩn hơn nha ✨",
+        "suggest_hdr": "Mình đề xuất vài lựa chọn phù hợp",
+        "product_pts": "Bạn thích kiểu mảnh hay thể thao? Mình lọc thêm màu & size giúp bạn nhé.",
         "highlights": "{title} có vài điểm nổi bật nè",
-        "policy_hint":"Theo chính sách shop:",
+        "policy_hint": "Theo chính sách shop:",
+        "smalltalk_hi": "Mình vẫn ổn nè, đang trực chat hỗ trợ bạn đây 😊",
+        "smalltalk_askback": "Bạn cần tìm món nào hôm nay để mình gợi ý nhanh nha?",
+        "new_hdr": "Hàng mới về nè ✨",
     },
     "en": {
-        "greet":      "Hello 👋 Happy to help! How can I assist you today? 🙂",
-        "browse":     "Feel free to explore our store 🛍️ 👉 {url}",
-        "oos":        "Sorry 🙏 that item is **out of stock** right now. Check similar picks here 👉 {url} ✨",
-        "fallback":   "I’m missing a bit of info 🤔. Share style/material/size and I’ll refine the picks ✨",
-        "suggest_hdr":"Here are a few good options",
-        "product_pts":"Prefer a slim or sporty style? I can filter color & size for you.",
+        "greet": "Hello 👋 Happy to help! How can I assist you today? 🙂",
+        "browse": "Feel free to explore our store 🛍️ 👉 {url}",
+        "oos": "Sorry 🙏 that item is **out of stock** right now. Check similar picks here 👉 {url} ✨",
+        "fallback": "I’m missing a bit of info 🤔. Share style/material/size and I’ll refine the picks ✨",
+        "suggest_hdr": "Here are a few good options",
+        "product_pts": "Prefer a slim or sporty style? I can filter color & size for you.",
         "highlights": "{title} highlights",
-        "policy_hint":"Store policy:",
+        "policy_hint": "Store policy:",
+        "smalltalk_hi": "I’m doing great and ready to help 😊",
+        "smalltalk_askback": "What are you looking for today so I can suggest fast?",
+        "new_hdr": "New arrivals ✨",
     },
     "zh": {
-        "greet":      "你好 👋 很高兴为你服务！需要我帮你做什么呢？🙂",
-        "browse":     "欢迎逛逛我们的商店 🛍️ 👉 {url}",
-        "oos":        "抱歉 🙏 该商品目前**缺货**。可以先看看类似的款式 👉 {url} ✨",
-        "fallback":   "还需要一些信息哦 🤔。说下风格/材质/尺寸，我再精准推荐 ✨",
-        "suggest_hdr":"给你几款合适的选择",
-        "product_pts":"想要纤细还是运动风？我可以按颜色和尺码再筛一轮。",
+        "greet": "你好 👋 很高兴为你服务！需要我帮你做什么呢？🙂",
+        "browse": "欢迎逛逛我们的商店 🛍️ 👉 {url}",
+        "oos": "抱歉 🙏 该商品目前**缺货**。可以先看看类似的款式 👉 {url} ✨",
+        "fallback": "还需要一些信息哦 🤔。说下风格/材质/尺寸，我再精准推荐 ✨",
+        "suggest_hdr": "给你几款合适的选择",
+        "product_pts": "想要纤细还是运动风？我可以按颜色和尺码再筛一轮。",
         "highlights": "{title} 的亮点",
-        "policy_hint":"店铺政策：",
+        "policy_hint": "店铺政策：",
+        "smalltalk_hi": "我很好，随时为你服务哦 😊",
+        "smalltalk_askback": "今天想找什么？我帮你快速推荐～",
+        "new_hdr": "新品上架 ✨",
     },
     "th": {
-        "greet":      "สวัสดี 👋 ยินดีให้บริการนะครับ/ค่ะ ต้องการให้ช่วยอะไรบ้าง 🙂",
-        "browse":     "เชิญชมสินค้าในเว็บได้เลย 🛍️ 👉 {url}",
-        "oos":        "ขออภัย 🙏 สินค้าชิ้นนั้น **หมดชั่วคราว** ค่ะ ลองดูรุ่นใกล้เคียงที่นี่ 👉 {url} ✨",
-        "fallback":   "ขอรายละเอียดเพิ่มอีกนิดนะคะ/ครับ เช่นสไตล์/วัสดุ/ขนาด ✨",
-        "suggest_hdr":"ขอแนะนำตัวเลือกที่เหมาะสม",
-        "product_pts":"ชอบแบบเพรียวหรือสปอร์ตดี? เดี๋ยวช่วยคัดสีและไซซ์ให้อีกได้ค่ะ/ครับ",
+        "greet": "สวัสดี 👋 ยินดีให้บริการนะครับ/ค่ะ ต้องการให้ช่วยอะไรบ้าง 🙂",
+        "browse": "เชิญชมสินค้าในเว็บได้เลย 🛍️ 👉 {url}",
+        "oos": "ขออภัย 🙏 สินค้าชิ้นนั้น **หมดชั่วคราว** ค่ะ ลองดูรุ่นใกล้เคียงที่นี่ 👉 {url} ✨",
+        "fallback": "ขอรายละเอียดเพิ่มอีกนิดนะคะ/ครับ เช่นสไตล์/วัสดุ/ขนาด ✨",
+        "suggest_hdr": "ขอแนะนำตัวเลือกที่เหมาะสม",
+        "product_pts": "ชอบแบบเพรียวหรือสปอร์ตดี? เดี๋ยวช่วยคัดสีและไซซ์ให้อีกได้ค่ะ/ครับ",
         "highlights": "จุดเด่นของ {title}",
-        "policy_hint":"นโยบายร้าน:",
+        "policy_hint": "นโยบายร้าน:",
+        "smalltalk_hi": "สบายดีมาก พร้อมช่วยเลยครับ/ค่ะ 😊",
+        "smalltalk_askback": "วันนี้อยากหาสินค้าแบบไหน เดี๋ยวแนะนำให้เร็ว ๆ นะ",
+        "new_hdr": "สินค้าเข้าใหม่ ✨",
     },
     "id": {
-        "greet":      "Halo 👋 Senang membantu! Ada yang bisa saya bantu? 🙂",
-        "browse":     "Silakan jelajahi toko kami 🛍️ 👉 {url}",
-        "oos":        "Maaf 🙏 produk itu **sedang kosong**. Coba lihat yang mirip di sini 👉 {url} ✨",
-        "fallback":   "Butuh info tambahan 🤔. Sebutkan gaya/bahan/ukuran ya, biar saya saringkan ✨",
-        "suggest_hdr":"Beberapa pilihan yang cocok",
-        "product_pts":"Suka model tipis atau sporty? Saya bisa saring warna & ukuran.",
+        "greet": "Halo 👋 Senang membantu! Ada yang bisa saya bantu? 🙂",
+        "browse": "Silakan jelajahi toko kami 🛍️ 👉 {url}",
+        "oos": "Maaf 🙏 produk itu **sedang kosong**. Coba lihat yang mirip di sini 👉 {url} ✨",
+        "fallback": "Butuh info tambahan 🤔. Sebutkan gaya/bahan/ukuran ya, biar saya saringkan ✨",
+        "suggest_hdr": "Beberapa pilihan yang cocok",
+        "product_pts": "Suka model tipis atau sporty? Saya bisa saring warna & ukuran.",
         "highlights": "Hal menarik dari {title}",
-        "policy_hint":"Kebijakan toko:",
+        "policy_hint": "Kebijakan toko:",
+        "smalltalk_hi": "Baik banget dan siap bantu 😊",
+        "smalltalk_askback": "Hari ini cari apa? Biar saya rekomendasikan cepat ya.",
+        "new_hdr": "Produk baru ✨",
     },
 }
-def t(lang: str, key: str, **kw) -> str:
-    lang = lang if lang in LANG_STRINGS else DEFAULT_LANG
-    s = LANG_STRINGS[lang].get(key) or LANG_STRINGS[DEFAULT_LANG].get(key, "")
-    return s.format(**kw)
 
-def greet_text(lang: str):
+
+def t(lang: str, key: str, **kw) -> str:
+    lang2 = lang if lang in LANG_STRINGS else DEFAULT_LANG
+    s = (LANG_STRINGS.get(lang2, {}).get(key)
+         or LANG_STRINGS.get(DEFAULT_LANG, {}).get(key)
+         or "")
+    try:
+        return s.format(**kw)
+    except Exception:
+        return s
+
+
+def greet_text(lang: str) -> str:
     return t(lang, "greet")
+
+# ==== Smalltalk & New arrivals (multi-lang) ====
+
+SMALLTALK_PATTERNS = {
+    "vi": [
+        r"\b(bn|bạn)\s*(kh[oơ]e|khoe)\s*(kh[oô]ng|ko|h[oơ]ng|hem)\b",
+        r"\b(kh[oơ]e|khoe)\s*(kh[oô]ng|ko|h[oơ]ng|hem)\b",
+        r"\b(h[oô]m\s*nay|nay)\s*(bạn|bn)?\s*(th[ếe]\s*n[aà]o|sao)\b",
+        r"\b(c[oó]\s*vui|vui\s*kh[oô]ng|vui\s*ko)\b",
+        r"\b(đang\s*làm\s*gì|lam gi|dạo\s*này|dao nay|ăn\s*cơm\s*chưa|ng[uư]\s*ch[aă]u?)\b",
+        r"\b(c[ảa]m ?[ơo]n|thanks|thank you|ty)\b",
+        r"\b(haha|hihi|kkk|:d|:v)\b",
+    ],
+    "en": [
+        r"\b(how are you|how's it going|how are u)\b",
+        r"\b(are you happy|feeling good)\b",
+        r"\b(what's up|sup)\b",
+        r"\b(have you eaten|had lunch)\b",
+        r"\b(thanks|thank you|ty)\b",
+    ],
+    "zh": [
+        r"(你好吗|最近怎么样|还好吗|心情如何|开心吗)",
+        r"(吃饭了吗|吃过饭没)",
+        r"(谢谢|多谢|感謝|感谢)",
+        r"(哈哈|嗨嗨|呵呵)",
+    ],
+    "th": [
+        r"(สบายดีไหม|เป็นไงบ้าง|เป็นอย่างไรบ้าง)",
+        r"(สนุกไหม|แฮปปี้ไหม)",
+        r"(กินข้าวยัง|ทานข้าวหรือยัง)",
+        r"(ขอบคุณ|thanks|thank you)",
+        r"(ฮ่าๆ|555)",
+    ],
+    "id": [
+        r"(apa kabar|gimana kabarnya|gmn kabar)",
+        r"(gimana hari ini|hari ini gimana)",
+        r"(senang tidak|bahagia tidak|happy ga)",
+        r"(sudah makan belum|udah makan belum)",
+        r"(terima kasih|makasih|thanks|thank you)",
+    ],
+}
+
+NEW_ITEMS_PATTERNS = {
+    "vi": [
+        r"(hàng|sp|mẫu|sản\s*phẩm).*(mới|vừa\s*về|new\s*arrivals)",
+        r"(có|đã).*(mẫu|sản\s*phẩm).*(mới|vừa\s*về)",
+        r"\b(new|mới|vừa về|new arrivals)\b",
+    ],
+    "en": [
+        r"(new\s*arrivals?|new\s*products?|what's\s*new)",
+        r"(any|have).*(new\s*items?)",
+    ],
+    "zh": [
+        r"(新品|新到|新貨|新货)",
+        r"(有.*新(品|货|貨)|來了.*新|来了.*新)",
+    ],
+    "th": [
+        r"(สินค้าเข้าใหม่|ของเข้าใหม่|ของใหม่|มาใหม่)",
+        r"(มีอะไรใหม่|มีสินค้าใหม่ไหม)",
+    ],
+    "id": [
+        r"(produk baru|barang baru|baru datang)",
+        r"(ada yang baru|ada produk baru)",
+    ],
+}
+
+def _pat(pats: dict, lang: str):
+    """Lấy list pattern theo ngôn ngữ, fallback về DEFAULT_LANG nếu không có."""
+    return pats.get(lang) or pats.get(DEFAULT_LANG, [])
+
 
 SYSTEM_STYLE = (
     "Bạn là trợ lý bán hàng Aloha tên là Aloha Bot. Tông giọng: thân thiện, chủ động, "
@@ -409,22 +576,45 @@ FEW_SHOT_EXAMPLES = [
 
 # ---- Intent routing ----
 POLICY_KEYWORDS  = {"chính sách","đổi trả","bảo hành","ship","vận chuyển","giao hàng","trả hàng","refund"}
-PRODUCT_KEYWORDS = {"mua","bán","giá","size","kích thước","chất liệu","màu","hợp","phù hợp","dây","đồng hồ","vòng","case","áo","quần","áo phông","tshirt","t-shirt","áo thun","sản phẩm"}
+PRODUCT_KEYWORDS = {
+    "mua","bán","giá","size","kích thước","chất liệu","màu","hợp","phù hợp",
+    "dây","đồng hồ","vòng","case","áo","quần","áo phông","tshirt","t-shirt","áo thun",
+    "sản phẩm", "bánh","crepe","bánh crepe","bánh sầu riêng","milktea","trà sữa"
+}
 BROWSE_KEYWORDS  = {"có những gì","bán gì","có gì","danh mục","catalog","xem hàng","tham quan","xem shop","xem sản phẩm","shop có gì","những sản phẩm gì"}
 _BROWSE_PATTERNS = [
     r"(shop|bên bạn|bên mình).*(bán|có).*(gì|những gì|những sản phẩm gì)",
     r"(bán|có).*(những\s+)?sản phẩm gì",
 ]
+# ==== Smalltalk & New arrivals ====
 
-def detect_intent(text:str):
-    t0 = (text or "").lower().strip()
+
+
+def detect_intent(text: str):
+    raw = (text or "")
+    t0  = re.sub(r"\s+", " ", raw.lower()).strip()
+    lang = detect_lang(raw)
+
     if any(k in t0 for k in POLICY_KEYWORDS):  return "policy"
-    if is_greeting(text):                      return "greet"
+    if is_greeting(raw):                       return "greet"
+
+    # smalltalk đa ngôn ngữ
+    if any(re.search(p, raw, flags=re.I) for p in _pat(SMALLTALK_PATTERNS, lang)):
+        return "smalltalk"
+
+    # browse: từ khóa + pattern chung
     if any(k in t0 for k in BROWSE_KEYWORDS):  return "browse"
-    if any(re.search(p, t0) for p in _BROWSE_PATTERNS): return "browse"
+    if any(re.search(p, t0) for p in _BROWSE_PATTERNS):     return "browse"
+
+    # hỏi hàng mới đa ngôn ngữ
+    if any(re.search(p, raw, flags=re.I) for p in _pat(NEW_ITEMS_PATTERNS, lang)):
+        return "new_items"
+
+    # sản phẩm & mô tả
     if any(k in t0 for k in PRODUCT_KEYWORDS): return "product"
     if "có bán" in t0 or "bán không" in t0 or "bán ko" in t0: return "product"
     if "có gì đặc biệt" in t0 or "điểm đặc biệt" in t0 or "có gì đặt biệt" in t0: return "product_info"
+
     return "other"
 
 def build_messages(system, history, context, user_question):
@@ -581,12 +771,21 @@ def answer_with_rag(user_id, user_question):
     lang = detect_lang(user_question)
     print(f"🔎 intent={intent} | 🗣️ lang={lang}")
 
+  # trong answer_with_rag, ngay sau print(...)
     if intent == "greet":
-        return (greet_text(lang)), []
+        return greet_text(lang), []
+
+    if intent == "smalltalk":               # <-- đưa smalltalk lên trước
+        return handle_smalltalk(user_question, lang=lang), []
 
     if intent == "browse":
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
-        return (t(lang, "browse", url=url)), []
+        return t(lang, "browse", url=url), []
+
+    if intent == "new_items":
+        items = get_new_arrivals(days=30, topk=4)
+        return compose_new_arrivals(lang=lang, items=items), items[:2]
+
 
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
     best = max(prod_scores or [0.0])
@@ -618,6 +817,8 @@ def answer_with_rag(user_id, user_question):
     if context:
         ans = compose_contextual_answer(context, user_question, hist)
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
+    
+    
 
     return (t(lang, "fallback")), []
 
