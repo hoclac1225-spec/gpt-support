@@ -115,12 +115,14 @@ def _remember(user_id, role, text):
 def _to_chat_messages(messages):
     """Chuyển format responses -> chat.completions để fallback."""
     chat_msgs = []
+    ALLOWED = {"input_text", "output_text", "text"}  # <-- thêm output_text
     for m in messages:
         role = m.get("role", "user")
         parts = m.get("content", [])
-        text = "\n".join([p.get("text","") for p in parts if p.get("type") in ("input_text","text")]).strip()
+        text = "\n".join([p.get("text","") for p in parts if p.get("type") in ALLOWED]).strip()
         chat_msgs.append({"role": role, "content": text})
     return chat_msgs
+
 
 def call_openai(messages, temperature=0.7):
     """
@@ -245,11 +247,28 @@ def fb_send_buttons(user_id, text, buttons, page_token):
     r = fb_call("/me/messages", payload, page_token=page_token)
     print(f"🔘 ButtonAPI status={getattr(r,'status_code',None)}")
 
+# === Reload vectors (FAISS) ===
+CANONICAL_DOMAIN = os.getenv("CANONICAL_DOMAIN", SHOP_URL).rstrip("/")
+ALIAS_DOMAINS = [d.strip().rstrip("/") for d in os.getenv("ALIAS_DOMAINS","").split(",") if d.strip()]
+
+def _canon_url(u: str) -> str:
+    if not u: return u
+    uu = u.strip()
+    for dom in ALIAS_DOMAINS:
+        if uu.startswith(dom + "/") or uu == dom:
+            return CANONICAL_DOMAIN + uu[len(dom):]
+    return uu
+
+def _apply_canonical_urls(meta):
+    if not meta: return meta
+    for d in meta:
+        if d.get("url"):
+            d["url"] = _canon_url(d["url"])
+    return meta
 
 # ========= RAG (FAISS) =========
 
 def _safe_read_index(prefix):
-        
     try:
         idx_path  = os.path.join(VECTOR_DIR, f"{prefix}.index")
         meta_path = os.path.join(VECTOR_DIR, f"{prefix}.meta.json")
@@ -258,17 +277,19 @@ def _safe_read_index(prefix):
             return None, None
         idx  = faiss.read_index(idx_path)
         meta = json.load(open(meta_path, encoding="utf-8"))
+
+        # --- Áp canonical domain cho mọi URL trong meta ---
+        meta = _apply_canonical_urls(meta)
+
         print(f"✅ {prefix} loaded: {len(meta)} chunks")
         return idx, meta
     except Exception as e:
         print(f"❌ Load index '{prefix}':", repr(e))
         return None, None
-
-
+    
 IDX_PROD, META_PROD = _safe_read_index("products")
 IDX_POL,  META_POL  = _safe_read_index("policies")
 
-# === Reload vectors (FAISS) ===
 def _reload_vectors():
     global IDX_PROD, META_PROD, IDX_POL, META_POL
     try:
@@ -400,13 +421,11 @@ def is_greeting(text: str) -> bool:
 # ——— Ngôn ngữ: detect & câu chữ
 def detect_lang(text: str) -> str:
     txt = (text or "").strip()
-    if not txt:
-        return DEFAULT_LANG
+    if not txt: return DEFAULT_LANG
     if re.search(r"[\u4e00-\u9fff]", txt):  # CJK
         return "zh" if "zh" in SUPPORTED_LANGS else DEFAULT_LANG
     if re.search(r"[\u0E00-\u0E7F]", txt):  # Thai
         return "th" if "th" in SUPPORTED_LANGS else DEFAULT_LANG
-    # Vietnamese diacritics
     if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộơóờởỡợíìỉĩịúùủũụưứừửữựýỳỷỹỵ]", txt, flags=re.I):
         return "vi" if "vi" in SUPPORTED_LANGS else DEFAULT_LANG
     if re.search(r"\b(yang|dan|tidak|saja|terima|kasih)\b", txt.lower()):
@@ -588,13 +607,13 @@ SYSTEM_STYLE = (
     "và hỏi lại 1 câu để làm rõ. Trình bày dễ đọc: gạch đầu dòng khi liệt kê; 1 câu chốt hành động."
 )
 
+# FEW_SHOT_EXAMPLES
 FEW_SHOT_EXAMPLES = [
     {"role":"user","content":[{"type":"input_text","text":"helo"}]},
-    {"role":"assistant","content":[{"type":"input_text","text":"Xin chào 👋 Rất vui được phục vụ bạn! Bạn muốn mình giúp gì không nè? 🙂"}]},
+    {"role":"assistant","content":[{"type":"output_text","text":"Xin chào 👋 Rất vui được phục vụ bạn! Bạn muốn mình giúp gì không nè? 🙂"}]},
     {"role":"user","content":[{"type":"input_text","text":"shop bạn có những gì"}]},
-    {"role":"assistant","content":[{"type":"input_text","text":"Mời bạn tham quan cửa hàng tại đây ạ 🛍️ 👉 https://shop.aloha.id.vn/zh"}]},
+    {"role":"assistant","content":[{"type":"output_text","text":f"Mời bạn tham quan cửa hàng tại đây ạ 🛍️ 👉 {SHOP_URL_MAP.get('vi', SHOP_URL)}"}]},
 ]
-
 # ---- Intent routing ----
 POLICY_KEYWORDS  = {"chính sách","đổi trả","bảo hành","ship","vận chuyển","giao hàng","trả hàng","refund"}
 PRODUCT_KEYWORDS = {
@@ -639,13 +658,15 @@ def detect_intent(text: str):
     return "other"
 
 def build_messages(system, history, context, user_question):
-    msgs = [{"role":"system","content":[{"type":"text","text":system}]}]
+    msgs = [{"role":"system","content":[{"type":"input_text","text":system}]}]
     msgs.extend(FEW_SHOT_EXAMPLES)
     for h in list(history)[-3:]:
-        msgs.append({"role": h["role"], "content":[{"type":"text","text":h["content"]}]} )
+        ctype = "output_text" if h["role"] == "assistant" else "input_text"
+        msgs.append({"role": h["role"], "content":[{"type": ctype, "text": h["content"]}]})
     user_block = f"(Nếu hữu ích thì dùng CONTEXT)\nCONTEXT:\n{context}\n\nCÂU HỎI: {user_question}"
-    msgs.append({"role":"user","content":[{"type":"text","text":user_block}]} )
+    msgs.append({"role":"user","content":[{"type":"input_text","text":user_block}]})
     return msgs
+
 
 # ---- Hiển thị tồn kho/OOS + emoji ----
 def _stock_line(d: dict) -> str:
