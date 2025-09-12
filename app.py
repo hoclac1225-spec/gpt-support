@@ -8,6 +8,23 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import hmac, hashlib, base64
 
+# --- text normalize helpers (có & không dấu)
+def _strip_accents(s: str) -> str:
+    if not s: return ""
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+def _normalize_text(s: str) -> str:
+    # giữ lại chữ, số, khoảng trắng, các bảng chữ cái mở rộng
+    return re.sub(r"[^0-9a-z\u00c0-\u024f\u1e00-\u1eff\u4e00-\u9fff\u0E00-\u0E7F ]", " ", (s or "").lower()).strip()
+
+def _norm_both(s: str):
+    """Trả về tuple (có_dấu, không_dấu) đã normalize & lower."""
+    n1 = _normalize_text(s)
+    n2 = _normalize_text(_strip_accents(s))
+    return n1, n2
+
+
 
 # ========= BOOTSTRAP =========
 load_dotenv()
@@ -57,13 +74,15 @@ REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "true").lower() == "true"
 EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 
 # Lọc & ngưỡng điểm
-SCORE_MIN    = float(os.getenv("PRODUCT_SCORE_MIN", "0.30"))
+SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.28"))
 STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
 
 print("=== BOOT ===")
 print("VECTOR_DIR:", os.path.abspath(VECTOR_DIR))
 print("TOKEN_MAP size:", len(TOKEN_MAP))
 print("OPENAI key set:", bool(OPENAI_API_KEY))
+
+
 
 
 # OpenAI
@@ -380,17 +399,17 @@ def is_greeting(text: str) -> bool:
 
 # ——— Ngôn ngữ: detect & câu chữ
 def detect_lang(text: str) -> str:
-    t = (text or "").strip()
-    if not t:
+    txt = (text or "").strip()
+    if not txt:
         return DEFAULT_LANG
-    if re.search(r"[\u4e00-\u9fff]", t):  # CJK
+    if re.search(r"[\u4e00-\u9fff]", txt):  # CJK
         return "zh" if "zh" in SUPPORTED_LANGS else DEFAULT_LANG
-    if re.search(r"[\u0E00-\u0E7F]", t):  # Thai
+    if re.search(r"[\u0E00-\u0E7F]", txt):  # Thai
         return "th" if "th" in SUPPORTED_LANGS else DEFAULT_LANG
     # Vietnamese diacritics
-    if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộơóờởỡợíìỉĩịúùủũụưứừửữựýỳỷỹỵ]", t, flags=re.I):
+    if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộơóờởỡợíìỉĩịúùủũụưứừửữựýỳỷỹỵ]", txt, flags=re.I):
         return "vi" if "vi" in SUPPORTED_LANGS else DEFAULT_LANG
-    if re.search(r"\b(yang|dan|tidak|saja|terima|kasih)\b", t.lower()):
+    if re.search(r"\b(yang|dan|tidak|saja|terima|kasih)\b", txt.lower()):
         return "id" if "id" in SUPPORTED_LANGS else DEFAULT_LANG
     return "en" if "en" in SUPPORTED_LANGS else DEFAULT_LANG
 
@@ -660,63 +679,163 @@ def _extract_features_from_text(text_block: str):
 
 # ====== TỪ KHÓA / ĐỒNG NGHĨA (đa ngôn ngữ) ======
 VN_SYNONYMS = {
-    "đồng hồ": ["dong ho","dong-ho","dongho","watch","watchface","galaxy watch","apple watch","amazfit","seiko","casio","nh35","nh36"],
-    "dây đồng hồ": ["day dong ho","daydongho","watch band","band","strap","loop","bracelet"],
-    "kính cường lực": ["kinh cuong luc","tempered glass","screen protector","full glass"],
-    "ốp lưng": ["op lung","case","cover","bumper"],
-    "áo thun": ["ao thun","ao phong","tshirt","t-shirt","tee"],
-    "áo phông": ["ao phong","ao thun","tshirt","t-shirt","tee"],
-    # Chinese / Thai / Indonesian
-    "手表": ["腕表","watch","表带","钢化膜","保护壳"],
-    "นาฬิกา": ["watch","สายนาฬิกา","ฟิล์มกระจก","เคส"],
-    "jam tangan": ["watch","tali jam","pelindung layar","case"],
+    # ===== Đồng hồ & phụ kiện =====
+    "đồng hồ": [
+        "dong ho","dong-ho","dongho","watch","watchface","watch face","bezel",
+        "galaxy watch","apple watch","amazfit","seiko","casio","nh35","nh36",
+        "automatic","mechanical","chronograph"
+    ],
+    "dây đồng hồ": [
+        "day dong ho","daydongho","watch band","band","strap","nato","loop",
+        "bracelet","mesh","leather strap","metal strap","silicone strap"
+    ],
+    "case đồng hồ": [
+        "case dong ho","vo dong ho","bao ve dong ho","bezel protector",
+        "watch case","watch bumper","watch cover","protective case"
+    ],
+    "kính cường lực": [
+        "kinh cuong luc","tempered glass","screen protector","glass protector",
+        "full glass","full cover","full glue","9h","anti-scratch","privacy glass"
+    ],
+    "ốp lưng": [
+        "op lung","case","cover","bumper","clear case","tpu case",
+        "silicone case","shockproof case","phone case","protective case"
+    ],
+    "vòng tay": [
+        "vong tay","bracelet","bangle","chain bracelet","cuff"
+    ],
+    "áo thun": [
+        "ao thun","ao phong","tshirt","t-shirt","tee","tee shirt","crewneck",
+        "basic tee","unisex tee","oversize tee"
+    ],
+    "áo phông": [
+        "ao phong","ao thun","tshirt","t-shirt","tee"
+    ],
+
+    # ===== Đồ ngọt/đồ uống (bổ sung cho shop) =====
+    "bánh": [
+        "banh","cake","gateau","pastry","甜品","點心","เค้ก","ขนม",
+        "kue","kueh","roti manis"
+    ],
+    "bánh crepe": [
+        "banh crepe","crepe","mille crepe","crepe cake",
+        "可丽饼","可麗餅","千层","千層","千层蛋糕","千層蛋糕",
+        "เครป","เครปเค้ก","kue crepe","mille crepes","kue lapis"
+    ],
+    "bánh sầu riêng": [
+        "banh sau rieng","durian","durian cake","durian crepe",
+        "榴莲","榴槤","榴莲千层","榴槤千層","榴莲千层蛋糕","榴槤千層蛋糕","榴莲可丽饼","榴槤可麗餅",
+        "เครปทุเรียน","เค้กทุเรียน",
+        "kue durian","crepe durian","kue lapis durian"
+    ],
+    "trà sữa": [
+        "tra sua","milk tea","bubble tea","boba","boba tea","pearl milk tea",
+        "奶茶","珍珠奶茶","波霸奶茶",
+        "ชานม","ชานมไข่มุก",
+        "teh susu","teh susu boba","minuman boba","bubble tea id"
+    ],
+    "milktea": [
+        "milk tea","bubble tea","boba","pearl milk tea",
+        "奶茶","珍珠奶茶","ชานมไข่มุก","teh susu","boba tea"
+    ],
+
+    # ===== Chinese (ZH) – nhóm theo khái niệm để bắt rộng hơn =====
+    "手表": ["腕表","watch","表带","表鏈","表圈","表壳","表殼","钢化膜","鋼化膜","保护壳","保護殼"],
+    "表带": ["表帶","表链","表鏈","watch band","strap","皮表带","金属表带","硅胶表带"],
+    "钢化膜": ["鋼化膜","玻璃膜","贴膜","貼膜","保护膜","保護膜","tempered glass","screen protector","全胶","全膠","9h"],
+    "手机壳": ["手機殼","保护壳","保護殼","手机套","phone case","case","bumper","保護殼"],
+    "T恤": ["T恤衫","短袖","圆领","圓領","tee","tshirt","t-shirt"], 
+    "奶茶": ["珍珠奶茶","波霸奶茶","奶盖茶","milk tea","bubble tea","boba"],
+    "可丽饼": ["可麗餅","法式薄饼","法式薄餅","千层","千層","千层蛋糕","千層蛋糕","crepe","mille crepe"],
+    "榴莲": ["榴槤","durian","榴莲千层","榴槤千層","榴莲可丽饼","榴槤可麗餅","榴莲蛋糕","榴槤蛋糕"],
+
+    # ===== Thai (TH) =====
+    "นาฬิกา": ["watch","สายนาฬิกา","ฟิล์มกระจก","กรอบนาฬิกา","เคสนาฬิกา"],
+    "สายนาฬิกา": ["watch band","strap","สายหนัง","สายโลหะ","สายซิลิโคน","นาโต้"],
+    "ฟิล์มกระจก": ["tempered glass","กระจกกันรอย","full glue","9h","screen protector"],
+    "เคสโทรศัพท์": ["เคส","ซองมือถือ","bumper","phone case","protective case"],
+    "เสื้อยืด": ["tshirt","t-shirt","tee","คอกลม","โอเวอร์ไซซ์"],
+    "ชานมไข่มุก": ["ชานม","bubble tea","boba","milk tea"],
+    "เครป": ["เครปเค้ก","crepe","mille crepe"],
+    "ทุเรียน": ["durian","เครปทุเรียน","เค้กทุเรียน"],
+
+    # ===== Indonesian (ID) =====
+    "jam tangan": ["watch","tali jam","pelindung layar","casing jam","bezel","case jam"],
+    "tali jam": ["watch band","strap","nato","kulit","logam","silikon"],
+    "pelindung layar": ["tempered glass","screen protector","kaca tempered","9h","full glue"],
+    "casing hp": ["case","casing","sarung hp","bumper","phone case"],
+    "kaos": ["tshirt","t-shirt","tee","kaos oversize","kaos unisex"],
+    "teh susu": ["bubble tea","boba","milk tea","minuman boba"],
+    "crepe": ["kue crepe","mille crepe","kue lapis","crepe cake"],
+    "durian": ["kue durian","crepe durian","kue lapis durian"]
 }
 
-def _normalize_text(s: str) -> str:
-    return re.sub(r"[^0-9a-z\u00c0-\u024f\u1e00-\u1eff\u4e00-\u9fff\u0E00-\u0E7F ]", " ", (s or "").lower())
+
 
 def _query_tokens(q: str, lang: str = "vi") -> set:
-    qn = _normalize_text(q)
-    words = [w for w in qn.split() if len(w) > 1]
-    tokens = set(words)
-    for i in range(len(words) - 1):
-        tokens.add((words[i] + words[i+1]).strip())  # bigram
+    """Sinh token từ câu hỏi: có dấu, không dấu, bigram, và cụm đồng nghĩa cơ bản."""
+    n1, n2 = _norm_both(q)
+    w1 = [w for w in n1.split() if len(w) > 1]
+    w2 = [w for w in n2.split() if len(w) > 1]
 
-    joined = " ".join(words)
+    tokens = set(w1) | set(w2)
+
+    # bigram cho cả có dấu & không dấu (để bắt “sầu riêng”, “banh sau”)
+    for words in (w1, w2):
+        for i in range(len(words) - 1):
+            tokens.add((words[i] + " " + words[i+1]).strip())
+            tokens.add((words[i] + words[i+1]).strip())  # biến thể không space
+
     combo_phrases = {
-        "vi": ["đồng hồ","áo thun","áo phông","dây đồng hồ","kính cường lực","ốp lưng"],
-        "en": ["watch band","screen protector","phone case","t shirt","t-shirt","watch"],
-        "zh": ["手表","腕表","表带","钢化膜","手机壳"],
-        "th": ["นาฬิกา","สายนาฬิกา","ฟิล์มกระจก","เคส"],
-        "id": ["jam tangan","tali jam","pelindung layar","case"],
+        "vi": ["đồng hồ","dây đồng hồ","kính cường lực","ốp lưng","áo thun","áo phông","bánh crepe","bánh sầu riêng","trà sữa"],
+        "en": ["watch band","screen protector","phone case","t shirt","t-shirt","mille crepe","durian crepe","milk tea","bubble tea","boba tea"],
+        "zh": ["手表","表带","钢化膜","手机壳","T恤","可丽饼","榴莲千层","奶茶","珍珠奶茶"],
+        "th": ["นาฬิกา","สายนาฬิกา","ฟิล์มกระจก","เคสโทรศัพท์","เสื้อยืด","เครป","เครปทุเรียน","ชานมไข่มุก"],
+        "id": ["jam tangan","tali jam","pelindung layar","casing hp","kaos","kue crepe","crepe durian","teh susu","bubble tea","boba"]
     }
-    for phrase in combo_phrases.get(lang, []):
-        if phrase in joined:
-            tokens.add(_normalize_text(phrase).replace(" ", ""))
-            for k, syns in VN_SYNONYMS.items():
-                if _normalize_text(k) in _normalize_text(phrase):
-                    for s in syns:
-                        tokens.add(_normalize_text(s).replace(" ", ""))
 
-    for synlist in VN_SYNONYMS.values():
-        for s in synlist:
-            if s in joined:
-                tokens.add(_normalize_text(s).replace(" ", ""))
-    return tokens
+    joined_n1 = " ".join(w1)
+    for phrase in combo_phrases.get(lang, []):
+        if phrase in joined_n1:
+            tokens.add(_normalize_text(phrase))
+            tokens.add(_normalize_text(_strip_accents(phrase)))
+
+    # ánh xạ synonyms: nếu text chứa “key” thì thêm tất cả synonym vào tokens
+    for key, syns in VN_SYNONYMS.items():
+        key_n1, key_n2 = _norm_both(key)
+        if key_n1 in n1 or key_n2 in n2:
+            for s in syns:
+                s1, s2 = _norm_both(s)
+                tokens.add(s1)
+                tokens.add(s2)
+                tokens.add(s1.replace(" ", ""))
+                tokens.add(s2.replace(" ", ""))
+
+    return set(t for t in tokens if len(t) >= 2)
+
 
 def filter_hits_by_query(hits, q, lang="vi"):
-    """Giữ lại hit có ít nhất 1 token/cụm của câu hỏi xuất hiện trong title/tags/type/variant."""
+    """Giữ hit nếu có token/cụm từ câu hỏi xuất hiện trong title/tags/type/variant (có & không dấu)."""
     if not hits:
         return []
     qtoks = _query_tokens(q, lang=lang)
+
     kept = []
     for d in hits:
-        hay = _normalize_text(" ".join([d.get("title",""), d.get("tags",""), d.get("product_type",""), d.get("variant","")]))
-        hay_no_space = hay.replace(" ", "")
-        ok = any((t in hay) or (t in hay_no_space) for t in qtoks)
+        hay_raw = " ".join([
+            d.get("title",""), d.get("tags",""), d.get("product_type",""), d.get("variant","")
+        ])
+        h1, h2 = _norm_both(hay_raw)
+        h1_ns, h2_ns = h1.replace(" ", ""), h2.replace(" ", "")
+
+        ok = any(
+            (t in h1) or (t in h2) or (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns)
+            for t in qtoks
+        )
         if ok:
             kept.append(d)
     return kept
+
 
 def should_relax_filter(q: str, hits: list) -> bool:
     qn = _normalize_text(q)
@@ -804,7 +923,7 @@ def answer_with_rag(user_id, user_question):
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
 
-    if intent in {"product","product_info","other"}:
+    if intent in {"product", "product_info"}:
         if not filtered_hits or best < SCORE_MIN:
             url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
             return (t(lang, "oos", url=url)), []
