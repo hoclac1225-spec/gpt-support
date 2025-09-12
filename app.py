@@ -494,40 +494,49 @@ def greet_text(lang: str) -> str:
 
 SMALLTALK_PATTERNS = {
     "vi": [
-        r"\b(bn|bạn)\s*(kh[oơ]e|khoe)\s*(kh[oô]ng|ko|h[oơ]ng|hem)\b",
-        r"\b(kh[oơ]e|khoe)\s*(kh[oô]ng|ko|h[oơ]ng|hem)\b",
-        r"\b(h[oô]m\s*nay|nay)\s*(bạn|bn)?\s*(th[ếe]\s*n[aà]o|sao)\b",
-        r"\b(c[oó]\s*vui|vui\s*kh[oô]ng|vui\s*ko)\b",
-        r"\b(đang\s*làm\s*gì|lam gi|dạo\s*này|dao nay|ăn\s*cơm\s*chưa|ng[uư]\s*ch[aă]u?)\b",
-        r"\b(c[ảa]m ?[ơo]n|thanks|thank you|ty)\b",
-        r"\b(haha|hihi|kkk|:d|:v)\b",
+        # bn/bạn khỏe/khỏe/khoẻ không/ko/hông/hem/hok
+        r"\b(bn|bạn)\s*(kh[oóòỏõọơớờởỡợ]e|khoe|khoẻ|khỏe)\s*(kh[oô]ng|ko|k|h[oơôóòõỏọ]ng|hong|hông|hem|hok)\b",
+        r"\b(kh[oóòỏõọơớờởỡợ]e|khoe|khoẻ|khỏe)\s*(kh[oô]ng|ko|k|h[oơôóòõỏọ]ng|hong|hông|hem|hok)\b",
+        # ổn không
+        r"\b(ổn|on)\s*(kh[oô]ng|ko|k|hong|h[oơ]ng|hem|hok)\b",
+        # hôm nay thế nào / nay sao
+        r"\b(h[oô]m?\s*nay|nay)\s*(bạn|bn)?\s*(th[ếe]\s*n[aà]o|sao|ok\s*kh[oô]ng)\b",
+        # đang làm gì / dạo này
+        r"\b(đang\s*làm\s*gì|làm\s*gì( vậy| đó)?|làm\s*chi|lam\s*gi)\b",
+        r"\b(dạo\s*này|dao\s*nay)\b",
+        # ăn cơm chưa / ngủ chưa
+        r"\b(ăn\s*cơm\s*chưa|ăn\s*chưa|an\s*chua|uống\s*chưa|ng[uư]\s*ch[aă]u?)\b",
+        # cảm ơn / thanks
+        r"\b(c[ảa]m\s?ơn|c[áa]m\s?ơn|thanks?|thank you|ty|tks|thx)\b",
+        # cười/emoji
+        r"\b(haha+|hihi+|hehe+|kkk+|=D|:d|:v|:3)\b|[😂🤣😆]",
     ],
     "en": [
-        r"\b(how are you|how's it going|how are u)\b",
-        r"\b(are you happy|feeling good)\b",
-        r"\b(what's up|sup)\b",
-        r"\b(have you eaten|had lunch)\b",
-        r"\b(thanks|thank you|ty)\b",
+        r"\b(how('?s)?\s*it\s*going|how\s*are\s*(you|u)|how\s*r\s*u|how\s*u\s*doin?g?)\b",
+        r"\b(what('?s)?\s*up|wass?up|sup|wyd)\b",
+        r"\b(have\s*you\s*eaten|had\s*(lunch|dinner)|grabbed\s*(lunch|food))\b",
+        r"\b(thanks?|thank\s*(you|u)|ty|thx|tysm|tks)\b",
+        r"\b(lol|lmao|rofl|haha+|hehe+|:d)\b|[😂🤣😆]",
     ],
     "zh": [
-        r"(你好吗|最近怎么样|还好吗|心情如何|开心吗)",
-        r"(吃饭了吗|吃过饭没)",
-        r"(谢谢|多谢|感謝|感谢)",
-        r"(哈哈|嗨嗨|呵呵)",
+        r"(你好吗|妳好吗|最近怎么样|最近如何|最近还好|还好吗|心情如何|开心吗|過得怎樣|过得怎样)",
+        r"(吃饭了吗|吃过饭没|吃了没|吃了吗)",
+        r"(谢谢|多谢|謝謝|感謝|感谢|謝啦|谢谢啦|谢啦)",
+        r"(哈哈+|嘿嘿+|呵呵+|嗨嗨+)|[😂🤣😆]",
     ],
     "th": [
-        r"(สบายดีไหม|เป็นไงบ้าง|เป็นอย่างไรบ้าง)",
-        r"(สนุกไหม|แฮปปี้ไหม)",
-        r"(กินข้าวยัง|ทานข้าวหรือยัง)",
-        r"(ขอบคุณ|thanks|thank you)",
-        r"(ฮ่าๆ|555)",
+        r"(สบายดี(ไหม|มั้ย|ป่าว)|เป็น(ไง|อย่างไร)บ้าง|โอเค(ไหม|มั้ย))",
+        r"(ทำอะไรอยู่|กำลังทำอะไร|ทำไรอยู่)",
+        r"(กินข้าว(หรือ)?ยัง|ทานข้าว(หรือ)?ยัง)",
+        r"(ขอบคุณ(ครับ|ค่ะ)?|ขอบใจ|thanks?|thank you|ty)",
+        r"(ฮ่า+ๆ+|555+)|[😂🤣😆]",
     ],
     "id": [
-        r"(apa kabar|gimana kabarnya|gmn kabar)",
-        r"(gimana hari ini|hari ini gimana)",
-        r"(senang tidak|bahagia tidak|happy ga)",
-        r"(sudah makan belum|udah makan belum)",
-        r"(terima kasih|makasih|thanks|thank you)",
+        r"(apa\s*kabar|gimana\s*kabarnya|gmn\s*kabar|kabarnya\s*gimana)",
+        r"(lagi\s*apa|lg\s*apa|sedang\s*apa|ngapain(\s*nih)?)",
+        r"(sudah|udah)\s*makan\s*(belum|blm)",
+        r"(terima\s*kasih|terimakasih|trimakasih|makasih|makasi|thanks?|thank you|thx|ty)",
+        r"(wkwk+|wk+|haha+|hehe+|:d)|[😂🤣😆]",
     ],
 }
 
