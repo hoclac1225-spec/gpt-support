@@ -185,17 +185,9 @@ def rephrase_casual(text: str, intent="generic", temperature=0.7, lang: str = No
         print("⚠️ rephrase error:", repr(e))
         return text + em(intent,1)
 def handle_smalltalk(text: str, lang: str = "vi") -> str:
-    alt = {
-        "vi": ["Hôm nay shop nhiều năng lượng lắm nè ⚡", "Vui ghê, đang ship đơn đều tay 🤝"],
-        "en": ["We’re full of energy today ⚡", "Orders are shipping steadily 🤝"],
-        "zh": ["今天精神满满 ⚡", "订单正在稳定发货中 🤝"],
-        "th": ["วันนี้ร้านไฟแรงมาก ⚡", "กำลังแพ็กของส่งเพียบเลย 🤝"],
-        "id": ["Toko lagi semangat banget hari ini ⚡", "Pesanan lagi ramai dikirim 🤝"],
-    }
-    base = [t(lang, "smalltalk_hi")] + alt.get(lang, alt["vi"])
-    follow = t(lang, "smalltalk_askback")
-    raw = f"{random.choice(base)} {follow}"
-    return rephrase_casual(raw, intent="generic", lang=lang, temperature=0.5)
+    # trả lời ngắn gọn, không gọi rephrase để tránh thêm CTA bán hàng
+    raw = f"{t(lang, 'smalltalk_hi')} {t(lang, 'smalltalk_askback')}".strip()
+    return raw
 
 
 # ========= FACEBOOK SENDER =========
@@ -417,8 +409,8 @@ LANG_STRINGS = {
         "product_pts": "Bạn thích kiểu mảnh hay thể thao? Mình lọc thêm màu & size giúp bạn nhé.",
         "highlights": "{title} có vài điểm nổi bật nè",
         "policy_hint": "Theo chính sách shop:",
-        "smalltalk_hi": "Mình vẫn ổn nè, đang trực chat hỗ trợ bạn đây 😊",
-        "smalltalk_askback": "Bạn cần tìm món nào hôm nay để mình gợi ý nhanh nha?",
+        "smalltalk_hi": "Hi 👋 Mình khỏe nè 😄",
+        "smalltalk_askback": "Hôm nay của bạn thế nào?",
         "new_hdr": "Hàng mới về nè ✨",
     },
     "en": {
@@ -430,8 +422,8 @@ LANG_STRINGS = {
         "product_pts": "Prefer a slim or sporty style? I can filter color & size for you.",
         "highlights": "{title} highlights",
         "policy_hint": "Store policy:",
-        "smalltalk_hi": "I’m doing great and ready to help 😊",
-        "smalltalk_askback": "What are you looking for today so I can suggest fast?",
+         "smalltalk_hi": "Hi 👋 I'm good! 😄",
+        "smalltalk_askback": "How's your day going?",
         "new_hdr": "New arrivals ✨",
     },
     "zh": {
@@ -443,8 +435,8 @@ LANG_STRINGS = {
         "product_pts": "想要纤细还是运动风？我可以按颜色和尺码再筛一轮。",
         "highlights": "{title} 的亮点",
         "policy_hint": "店铺政策：",
-        "smalltalk_hi": "我很好，随时为你服务哦 😊",
-        "smalltalk_askback": "今天想找什么？我帮你快速推荐～",
+        "smalltalk_hi": "嗨 👋 我很好喔 😄",
+        "smalltalk_askback": "你今天过得怎么样？",
         "new_hdr": "新品上架 ✨",
     },
     "th": {
@@ -456,8 +448,8 @@ LANG_STRINGS = {
         "product_pts": "ชอบแบบเพรียวหรือสปอร์ตดี? เดี๋ยวช่วยคัดสีและไซซ์ให้อีกได้ค่ะ/ครับ",
         "highlights": "จุดเด่นของ {title}",
         "policy_hint": "นโยบายร้าน:",
-        "smalltalk_hi": "สบายดีมาก พร้อมช่วยเลยครับ/ค่ะ 😊",
-        "smalltalk_askback": "วันนี้อยากหาสินค้าแบบไหน เดี๋ยวแนะนำให้เร็ว ๆ นะ",
+         "smalltalk_hi": "ไฮ 👋 สบายดีมากเลยนะ 😄",
+        "smalltalk_askback": "วันนี้ของคุณเป็นยังไงบ้าง?",
         "new_hdr": "สินค้าเข้าใหม่ ✨",
     },
     "id": {
@@ -469,8 +461,8 @@ LANG_STRINGS = {
         "product_pts": "Suka model tipis atau sporty? Saya bisa saring warna & ukuran.",
         "highlights": "Hal menarik dari {title}",
         "policy_hint": "Kebijakan toko:",
-        "smalltalk_hi": "Baik banget dan siap bantu 😊",
-        "smalltalk_askback": "Hari ini cari apa? Biar saya rekomendasikan cepat ya.",
+       "smalltalk_hi": "Hai 👋 Aku baik-baik saja 😄",
+        "smalltalk_askback": "Harinya kamu gimana?",
         "new_hdr": "Produk baru ✨",
     },
 }
