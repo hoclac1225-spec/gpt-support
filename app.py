@@ -2,15 +2,20 @@
 import unicodedata
 import os, json, time, re, requests, numpy as np, faiss, threading, random
 from collections import deque
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify  # bỏ abort nếu không dùng
 from flask_cors import CORS
 from dotenv import load_dotenv
 from openai import OpenAI
 import hmac, hashlib, base64
+from typing import Optional  # nếu Python < 3.10 thì dùng Optional
+
+# Load .env TRƯỚC khi đọc os.getenv
+load_dotenv()
 
 # --- text normalize helpers (có & không dấu)
 def _strip_accents(s: str) -> str:
-    if not s: return ""
+    if not s:
+        return ""
     s = unicodedata.normalize("NFKD", s)
     return "".join(ch for ch in s if not unicodedata.combining(ch))
 
@@ -23,40 +28,80 @@ def _norm_both(s: str):
     n1 = _normalize_text(s)
     n2 = _normalize_text(_strip_accents(s))
     return n1, n2
-# số từ tối thiểu phải trùng trong title (có thể cho vào ENV nếu muốn)
+
+def _char_ngrams(s: str, n=2):
+    s = _normalize_text(s)
+    s = re.sub(r"\s+", "", s)
+    if not s:
+        return set()
+    if len(s) < n:
+        return {s}
+    return {s[i:i+n] for i in range(len(s)-n+1)}
+
+# --- Title overlap config (đặt ở cấp module, sau load_dotenv) ---
 TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "2"))
+TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.25"))
+TITLE_MAX_CHECK = int(os.getenv("TITLE_MAX_CHECK", "5"))
 
-def _has_title_overlap(q, hits, min_words: int = TITLE_MIN_WORDS, min_cover: float = 0.6):
+def _has_title_overlap(
+    q: str,
+    hits: list,
+    min_words: Optional[int] = None,   # nếu dùng Python 3.10+ có thể dùng: int | None
+    min_cover: float = 0.6
+) -> bool:
     """
-    Trả True nếu:
-    - Có ít nhất 'min_words' từ trong câu hỏi xuất hiện trong title (đã normalize, có/không dấu), HOẶC
-    - Tỷ lệ phủ từ (matched/len(tokens)) >= min_cover  (fallback cho câu rất ngắn / ngôn ngữ không có khoảng trắng)
+    Kiểm tra mức trùng khớp giữa câu hỏi và title các hit.
+    - Ngôn ngữ có khoảng trắng: yêu cầu số từ trùng tối thiểu (TITLE_MIN_WORDS) hoặc tỉ lệ phủ >= min_cover.
+    - CJK/không có khoảng trắng: dùng bigram ký tự với ngưỡng TITLE_CJK_MIN_COVER.
     """
+    if not q or not hits:
+        return False
+
+    if min_words is None:
+        min_words = TITLE_MIN_WORDS
+
     qn1, qn2 = _norm_both(q)
-    # tokens theo khoảng trắng, bỏ từ 1 ký tự
     qtok = [w for w in qn1.split() if len(w) > 1]
-    if not qtok:                    # ví dụ tiếng Trung → không tách được từ
-        qtok = [qn1]                # fallback: dùng cả chuỗi đã normalize
 
-    for d in hits[:5]:
+    # CJK/không có khoảng trắng → so trùng bigram ký tự
+    if not qtok or re.search(r"[\u4e00-\u9fff]", q):
+        qgrams = _char_ngrams(qn1, 2) | _char_ngrams(qn2, 2)
+        if not qgrams:
+            return False
+        for d in hits[:TITLE_MAX_CHECK]:
+            t1, t2 = _norm_both(d.get("title", ""))
+            tgrams = _char_ngrams(t1, 2) | _char_ngrams(t2, 2)
+            cover = len(qgrams & tgrams) / max(1, len(qgrams))
+            if cover >= TITLE_CJK_MIN_COVER:
+                return True
+        return False
+
+    # Ngôn ngữ có khoảng trắng → so theo từ
+    for d in hits[:TITLE_MAX_CHECK]:
         t1, t2 = _norm_both(d.get("title", ""))
         matched = sum(1 for w in qtok if (w in t1) or (w in t2))
-
-        # Điều kiện “ít nhất N từ trùng”
         cond_min_words = (len(qtok) >= min_words and matched >= min_words)
-        # Fallback coverage (giữ logic cũ): hữu ích khi câu hỏi quá ngắn
         cond_cover = (matched / max(1, len(qtok))) >= min_cover
-
         if cond_min_words or cond_cover:
             return True
     return False
 
-
-
+# (tuỳ chọn) Alias để tương thích nếu trước đây gọi tên hàm là "_"
+_ = _has_title_overlap
 
 # ========= BOOTSTRAP =========
-load_dotenv()
+
 app = Flask(__name__)
+
+APP_SECRET = os.getenv("FB_APP_SECRET", "")
+
+def _verify_fb_sig(req):
+    sig = req.headers.get("X-Hub-Signature-256", "")
+    if not APP_SECRET or not sig.startswith("sha256="):
+        return False
+    digest = hmac.new(APP_SECRET.encode(), req.get_data(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest("sha256=" + digest, sig)
+
 
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "")
 origins = [o.strip() for o in allowed_origins.split(",")] if allowed_origins else ["*"]
@@ -123,7 +168,20 @@ oai_client   = OpenAI(api_key=OPENAI_API_KEY)
 # ========= SMALL IN-MEMORY SESSION =========
 SESS = {}
 SESS_LOCK = threading.Lock()
-SESSION_TTL = 60 * 30  # 30 phút không tương tác thì reset
+SESSION_TTL = 60 * 30  # 30 phút
+SESS_MAX = int(os.getenv("SESS_MAX", "2000"))
+
+def _purge_sessions():
+    now = time.time()
+    # xoá hết session hết hạn
+    expired = [k for k,v in SESS.items() if now - v.get("ts",0) > SESSION_TTL]
+    for k in expired:
+        SESS.pop(k, None)
+    # nếu vẫn vượt quá SESS_MAX → LRU trim
+    if len(SESS) > SESS_MAX:
+        extra = len(SESS) - SESS_MAX
+        for k,_ in sorted(SESS.items(), key=lambda kv: kv[1].get("ts",0))[:extra]:
+            SESS.pop(k, None)
 
 def _get_sess(user_id):
     now = time.time()
@@ -133,11 +191,16 @@ def _get_sess(user_id):
             s = {"hist": deque(maxlen=8), "last_mid": None, "ts": now}
             SESS[user_id] = s
         s["ts"] = now
+        # chỉ purge khi cần để tiết kiệm CPU
+        if len(SESS) > SESS_MAX:
+            _purge_sessions()
         return s
-
+    
 def _remember(user_id, role, text):
     s = _get_sess(user_id)
     s["hist"].append({"role": role, "content": text})
+
+
 
 # ========= OPENAI WRAPPER =========
 def _to_chat_messages(messages):
@@ -332,10 +395,15 @@ def _reload_vectors():
         print("❌ reload vectors:", repr(e))
         return False
 
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
 @app.post("/admin/reload_vectors")
 def admin_reload_vectors():
+    if ADMIN_TOKEN and request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
     ok = _reload_vectors()
     return jsonify({"ok": ok})
+
 
 def _embed_query(q: str) -> np.ndarray:
     t0 = time.time()
@@ -426,18 +494,24 @@ def compose_new_arrivals(lang: str = "vi", items=None):
     items = items or []
     if not items:
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
-        return rephrase_casual(t(lang,"browse", url=url), intent="browse", lang=lang)
+        return rephrase_casual(t(lang, "browse", url=url), intent="browse", lang=lang)
+
     lines = []
     for d in items[:2]:
         title = d.get("title") or "Sản phẩm"
-        price = d.get("price")
         stock = _stock_line(d)
+        pval  = _price_value(d)
+        currency = d.get("currency") or ("₫" if lang == "vi" else "")
+        pstr  = _fmt_price(pval, currency) if pval is not None else None
+
         line = f"• {title}"
-        if price: line += f" — {price} đ"
+        if pstr: line += f" — {pstr}"
         line += f" — {stock}"
         lines.append(line)
+
     raw = f"{t(lang,'new_hdr')}\n" + "\n".join(lines) + "\n\n" + t(lang,"product_pts")
     return rephrase_casual(raw, intent="product", lang=lang)
+
 
 
 # ========= INTENT, PERSONA, FEW-SHOT & NATURAL REPLY =========
@@ -725,40 +799,45 @@ def _fmt_price(p, currency="₫"):
     if p is None:
         return None
     try:
-        s = re.sub(r"[^\d.]", "", str(p))
+        # nếu p là string: chỉ giữ chữ số
+        s = re.sub(r"\D", "", str(p))
         if not s:
             return None
         val = int(float(s))
         return f"{val:,.0f}".replace(",", ".") + (f" {currency}" if currency else "")
     except Exception:
-        return str(p)
+        return None
 
 def _extract_price_number(txt: str):
-    """Trả về số (float) nếu bắt được 199k/199.000đ/199000 vnd..., else None"""
+    """Bắt 199k / 199.000đ / 1,299,000 VND… → số (float)."""
     if not txt:
         return None
-    low = txt.lower()
-    m = re.search(r"(\d[\d\.\s,]{2,})(?:\s?)(đ|₫|vnd|vnđ|k)\b", low)
+    low = str(txt).lower()
+    m = re.search(r"(\d[\d\.\s,]{2,})(?:\s*)(đ|₫|vnd|vnđ|k)?\b", low)
     try:
         if m:
-            num = re.sub(r"[^\d.]", "", m.group(1))
-            v = float(num)
-            return v*1000 if m.group(2) == "k" else v
-        m2 = re.search(r"\b(\d{5,})\b", low)
+            digits = re.sub(r"\D", "", m.group(1))  # chỉ chữ số
+            if not digits:
+                return None
+            v = float(digits)
+            return v * 1000 if (m.group(2) == "k") else v
+        m2 = re.search(r"\b(\d{4,})\b", low)  # fallback chuỗi số dài
         return float(m2.group(1)) if m2 else None
     except Exception:
         return None
 
+
 def _price_value(d: dict):
-    """Trả numeric price tốt nhất từ meta; fallback bắt trong text."""
     for k in ("price","min_price","max_price"):
         v = d.get(k)
         if v is not None:
             try:
-                return float(re.sub(r"[^\d.]", "", str(v)))
+                digits = re.sub(r"\D", "", str(v))
+                return float(digits) if digits else None
             except Exception:
                 pass
     return _extract_price_number(d.get("text",""))
+
 
 def _category_key_from_doc(d: dict):
     """Xác định 'dòng' sản phẩm để so min–max: ưu tiên product_type; fallback theo synonyms trong title/tags."""
@@ -918,18 +997,34 @@ VN_SYNONYMS = {
     "crepe": ["kue crepe","mille crepe","kue lapis","crepe cake"],
     "durian": ["kue durian","crepe durian","kue lapis durian"]
 }
+def add_syn(key, words):
+    arr = VN_SYNONYMS.setdefault(key, [])
+    # nối và khử trùng lặp, giữ thứ tự
+    VN_SYNONYMS[key] = list(dict.fromkeys(arr + words))
+
+add_syn("榴槤", ["榴莲","durian","榴槤千層","榴槤可麗餅","榴槤蛋糕","榴槤千層蛋糕"])
+add_syn("可麗餅", ["可丽饼","crepe","mille crepe","crepe cake","千層","千層蛋糕","法式可麗餅"])
+add_syn("奶茶", ["珍珠奶茶","波霸奶茶","奶蓋茶","milk tea","bubble tea","boba"])
+add_syn("市集", ["market","marketplace","集市","bazaar"])
+add_syn("台灣", ["臺灣","台湾","taiwan","tw"])
+add_syn("臺灣", ["台灣","台湾","taiwan","tw"])
+add_syn("澳洲", ["australia","úc","au"])
+add_syn("越南", ["vietnam","việt nam","vn"])
+
+
+# --- Bổ sung đồng nghĩa cho shop (TW/繁體) ---
 
 
 
 def _query_tokens(q: str, lang: str = "vi") -> set:
-    """Sinh token từ câu hỏi: có dấu, không dấu, bigram, và cụm đồng nghĩa cơ bản."""
+    """Sinh token từ câu hỏi: có dấu, không dấu, bigram, cụm phrase và synonyms."""
     n1, n2 = _norm_both(q)
     w1 = [w for w in n1.split() if len(w) > 1]
     w2 = [w for w in n2.split() if len(w) > 1]
 
     tokens = set(w1) | set(w2)
 
-    # bigram cho cả có dấu & không dấu (để bắt “sầu riêng”, “banh sau”)
+    # bigram cho cả có dấu & không dấu (bắt 'sầu riêng', 'banh sau'...)
     for words in (w1, w2):
         for i in range(len(words) - 1):
             tokens.add((words[i] + " " + words[i+1]).strip())
@@ -946,21 +1041,28 @@ def _query_tokens(q: str, lang: str = "vi") -> set:
     joined_n1 = " ".join(w1)
     for phrase in combo_phrases.get(lang, []):
         if phrase in joined_n1:
-            tokens.add(_normalize_text(phrase))
-            tokens.add(_normalize_text(_strip_accents(phrase)))
+            p1, p2 = _norm_both(phrase)
+            tokens.update({p1, p2, p1.replace(" ", ""), p2.replace(" ", "")})
 
-    # ánh xạ synonyms: nếu text chứa “key” thì thêm tất cả synonym vào tokens
+    # Ánh xạ synonyms (đặt NGOÀI vòng for phrase)
     for key, syns in VN_SYNONYMS.items():
         key_n1, key_n2 = _norm_both(key)
-        if key_n1 in n1 or key_n2 in n2:
+
+        seen = (key_n1 in n1) or (key_n2 in n2)
+        if not seen:
             for s in syns:
                 s1, s2 = _norm_both(s)
-                tokens.add(s1)
-                tokens.add(s2)
-                tokens.add(s1.replace(" ", ""))
-                tokens.add(s2.replace(" ", ""))
+                if s1 in n1 or s2 in n2:
+                    seen = True
+                    break
 
-    return set(t for t in tokens if len(t) >= 2)
+        if seen:
+            for s in [key] + list(syns):
+                s1, s2 = _norm_both(s)
+                tokens.update({s1, s2, s1.replace(" ", ""), s2.replace(" ", "")})
+
+    return {t for t in tokens if len(t) >= 2}
+
 
 
 def filter_hits_by_query(hits, q, lang="vi"):
@@ -1072,7 +1174,7 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
         hp = _fmt_price(_price_value(high), currency)
         sug.append(f"• **Cùng dòng – giá cao nhất:** {high.get('title','SP')} — {hp}")
     if low:
-        lp = _fmt_price(_price_value(low), currency)  # đã sửa _ue → _price_value
+        lp = _fmt_price(_price_value(low), currency)
         sug.append(f"• **Cùng dòng – giá thấp nhất:** {low.get('title','SP')} — {lp}")
 
     if sug:
@@ -1081,8 +1183,10 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
     lines.append(t(lang, "product_pts"))
     raw = "\n".join(lines)
 
-    btns = [x for x in (high, low) if x]
+    # Thêm SP chính vào button đầu tiên
+    btns = [main] + [x for x in (high, low) if x]
     return rephrase_casual(raw, intent="product", lang=lang), btns[:2]
+
 
 
 def answer_with_rag(user_id, user_question):
@@ -1174,25 +1278,30 @@ def webhook():
         challenge = request.args.get("hub.challenge")
         return (challenge, 200) if token == VERIFY_TOKEN else ("Invalid verification token", 403)
 
+    # POST: verify Facebook signature
+    if not _verify_fb_sig(request):
+        return "Invalid signature", 403
+
     payload = request.json or {}
 
     for entry in payload.get("entry", []):
         owner_id = str(entry.get("id"))           # Page ID hoặc IG Account ID
         access_token = TOKEN_MAP.get(owner_id)
         if not access_token:
-            print("⚠️ No token mapped for:", owner_id); 
+            print("⚠️ No token mapped for:", owner_id)
             continue
 
         for event in entry.get("messaging", []):
             if event.get("message", {}).get("is_echo"):
                 continue
+
             if event.get("message") and "text" in event["message"]:
                 psid = event["sender"]["id"]
                 text = event["message"]["text"]
                 mid  = event["message"].get("mid")
 
                 sess = _get_sess(psid)
-                if mid and sess["last_mid"] == mid: 
+                if mid and sess["last_mid"] == mid:
                     continue
                 sess["last_mid"] = mid
 
@@ -1209,22 +1318,24 @@ def webhook():
                     buttons = []
                     for h in btn_hits[:2]:
                         if h.get("url"):
-                            buttons.append({"type":"web_url","url":h["url"],"title":(h.get("title") or "Xem sản phẩm")[:20]})
+                            buttons.append({
+                                "type": "web_url",
+                                "url": h["url"],
+                                "title": (h.get("title") or "Xem sản phẩm")[:20]
+                            })
                     if buttons:
                         fb_send_buttons(psid, "Xem nhanh:", buttons, access_token)
 
             elif event.get("postback", {}).get("payload"):
                 psid = event["sender"]["id"]
                 fb_send_text(psid, f"Bạn vừa chọn: {event['postback']['payload']}", access_token)
-            # quick reply payload (nếu dùng quick_replies)
+
             elif event.get("message", {}).get("quick_reply", {}).get("payload"):
                 psid = event["sender"]["id"]
                 qr_payload = event["message"]["quick_reply"]["payload"]
                 fb_send_text(psid, f"Bạn vừa chọn: {qr_payload}", access_token)
 
-
     return "ok", 200
-
 
 # ========= API =========
 @app.route("/api/chat", methods=["POST"])
@@ -1308,7 +1419,7 @@ def health():
     })
 
 # ========= Watcher: tự reload khi vector đổi =========
-from apscheduler.schedulers.background import BackgroundScheduler
+
 
 _last_vec_mtime = 0
 def _mtime(path):
@@ -1332,16 +1443,21 @@ def _watch_vectors():
 
 def _start_vector_watcher():
     try:
+        from apscheduler.schedulers.background import BackgroundScheduler
         sch = BackgroundScheduler(timezone="Asia/Ho_Chi_Minh")
         sch.add_job(_watch_vectors, "interval", seconds=30, id="watch_vectors")
+        sch.add_job(lambda: (_purge_sessions()), "interval", minutes=10, id="purge_sessions")
         sch.start()
         print("⏱️ Vector watcher started (30s)")
     except Exception as e:
         print("⚠️ Scheduler error:", repr(e))
 
+
+
 # ======== MAIN ========
 if __name__ == "__main__":
-    _start_vector_watcher()
+    if os.getenv("ENABLE_VECTOR_WATCHER", "true").lower() == "true":
+        _start_vector_watcher()
     port = int(os.getenv("PORT", 3000))
     print(f"🚀 Starting app on 0.0.0.0:{port}")
-    # app.run(host="0.0.0.0", port=port, debug=False)  # khi chạy local
+    # app.run(host="0.0.0.0", port=port, debug=False)
