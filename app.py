@@ -413,6 +413,7 @@ def detect_lang(text: str) -> str:
         return "id" if "id" in SUPPORTED_LANGS else DEFAULT_LANG
     return "en" if "en" in SUPPORTED_LANGS else DEFAULT_LANG
 
+
 # ====== MULTI-LANG PATTERNS (smalltalk & new arrivals) ======
 # Mỗi ngôn ngữ là 1 list regex. Có thể bổ sung dần mà không đụng chỗ khác.
 # ==== Smalltalk & New arrivals (multi-lang) ====
@@ -638,12 +639,12 @@ def detect_intent(text: str):
     return "other"
 
 def build_messages(system, history, context, user_question):
-    msgs = [{"role":"system","content":[{"type":"input_text","text":system}]}]
+    msgs = [{"role":"system","content":[{"type":"text","text":system}]}]
     msgs.extend(FEW_SHOT_EXAMPLES)
     for h in list(history)[-3:]:
-        msgs.append({"role":h["role"], "content":[{"type":"input_text","text":h["content"]}]})
+        msgs.append({"role": h["role"], "content":[{"type":"text","text":h["content"]}]} )
     user_block = f"(Nếu hữu ích thì dùng CONTEXT)\nCONTEXT:\n{context}\n\nCÂU HỎI: {user_question}"
-    msgs.append({"role":"user","content":[{"type":"input_text","text":user_block}]})
+    msgs.append({"role":"user","content":[{"type":"text","text":user_block}]} )
     return msgs
 
 # ---- Hiển thị tồn kho/OOS + emoji ----
