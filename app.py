@@ -23,6 +23,34 @@ def _norm_both(s: str):
     n1 = _normalize_text(s)
     n2 = _normalize_text(_strip_accents(s))
     return n1, n2
+# số từ tối thiểu phải trùng trong title (có thể cho vào ENV nếu muốn)
+TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "2"))
+
+def _has_title_overlap(q, hits, min_words: int = TITLE_MIN_WORDS, min_cover: float = 0.6):
+    """
+    Trả True nếu:
+    - Có ít nhất 'min_words' từ trong câu hỏi xuất hiện trong title (đã normalize, có/không dấu), HOẶC
+    - Tỷ lệ phủ từ (matched/len(tokens)) >= min_cover  (fallback cho câu rất ngắn / ngôn ngữ không có khoảng trắng)
+    """
+    qn1, qn2 = _norm_both(q)
+    # tokens theo khoảng trắng, bỏ từ 1 ký tự
+    qtok = [w for w in qn1.split() if len(w) > 1]
+    if not qtok:                    # ví dụ tiếng Trung → không tách được từ
+        qtok = [qn1]                # fallback: dùng cả chuỗi đã normalize
+
+    for d in hits[:5]:
+        t1, t2 = _norm_both(d.get("title", ""))
+        matched = sum(1 for w in qtok if (w in t1) or (w in t2))
+
+        # Điều kiện “ít nhất N từ trùng”
+        cond_min_words = (len(qtok) >= min_words and matched >= min_words)
+        # Fallback coverage (giữ logic cũ): hữu ích khi câu hỏi quá ngắn
+        cond_cover = (matched / max(1, len(qtok))) >= min_cover
+
+        if cond_min_words or cond_cover:
+            return True
+    return False
+
 
 
 
@@ -598,6 +626,17 @@ NEW_ITEMS_PATTERNS = {
 def _pat(pats: dict, lang: str):
     """Lấy list pattern theo ngôn ngữ, fallback về DEFAULT_LANG nếu không có."""
     return pats.get(lang) or pats.get(DEFAULT_LANG, [])
+# ===== Giá / Price questions (multi-lang) =====
+PRICE_PATTERNS = {
+    "vi": [r"\bgiá\b", r"bao nhiêu", r"nhiêu tiền", r"\bgiá bao nhiêu\b", r"\bbao nhieu\b"],
+    "en": [r"\bprice\b", r"how much", r"\bcost\b"],
+    "zh": [r"(价格|幾錢|多少钱|多少錢)"],
+    "th": [r"(ราคา|เท่าไหร่|เท่าไร)"],
+    "id": [r"(harga|berapa)"],
+}
+def is_price_question(text: str, lang: str) -> bool:
+    raw = (text or "")
+    return any(re.search(p, raw, flags=re.I) for p in _pat(PRICE_PATTERNS, lang))
 
 
 SYSTEM_STYLE = (
@@ -649,6 +688,9 @@ def detect_intent(text: str):
     # hỏi hàng mới đa ngôn ngữ
     if any(re.search(p, raw, flags=re.I) for p in _pat(NEW_ITEMS_PATTERNS, lang)):
         return "new_items"
+    # Hỏi giá → ưu tiên product_info
+    if is_price_question(raw, lang):
+        return "product_info"
 
     # sản phẩm & mô tả
     if any(k in t0 for k in PRODUCT_KEYWORDS): return "product"
@@ -679,6 +721,91 @@ def _stock_line(d: dict) -> str:
 def _shorten(txt: str, n=280) -> str:
     t = (txt or "").strip()
     return (t[:n].rstrip() + "…") if len(t) > n else t
+def _fmt_price(p, currency="₫"):
+    if p is None:
+        return None
+    try:
+        s = re.sub(r"[^\d.]", "", str(p))
+        if not s:
+            return None
+        val = int(float(s))
+        return f"{val:,.0f}".replace(",", ".") + (f" {currency}" if currency else "")
+    except Exception:
+        return str(p)
+
+def _extract_price_number(txt: str):
+    """Trả về số (float) nếu bắt được 199k/199.000đ/199000 vnd..., else None"""
+    if not txt:
+        return None
+    low = txt.lower()
+    m = re.search(r"(\d[\d\.\s,]{2,})(?:\s?)(đ|₫|vnd|vnđ|k)\b", low)
+    try:
+        if m:
+            num = re.sub(r"[^\d.]", "", m.group(1))
+            v = float(num)
+            return v*1000 if m.group(2) == "k" else v
+        m2 = re.search(r"\b(\d{5,})\b", low)
+        return float(m2.group(1)) if m2 else None
+    except Exception:
+        return None
+
+def _price_value(d: dict):
+    """Trả numeric price tốt nhất từ meta; fallback bắt trong text."""
+    for k in ("price","min_price","max_price"):
+        v = d.get(k)
+        if v is not None:
+            try:
+                return float(re.sub(r"[^\d.]", "", str(v)))
+            except Exception:
+                pass
+    return _extract_price_number(d.get("text",""))
+
+def _category_key_from_doc(d: dict):
+    """Xác định 'dòng' sản phẩm để so min–max: ưu tiên product_type; fallback theo synonyms trong title/tags."""
+    pt = (d.get("product_type") or "").strip()
+    if pt:
+        return _normalize_text(pt)
+    raw = " ".join([d.get("title",""), d.get("tags","")])
+    n1, n2 = _norm_both(raw)
+    for key in VN_SYNONYMS.keys():
+        k1, k2 = _norm_both(key)
+        if k1 in n1 or k2 in n2:
+            return _normalize_text(key)
+    return "misc"
+
+def _minmax_in_category(base_doc: dict):
+    """Tìm 1 mẫu rẻ nhất và 1 mẫu đắt nhất cùng dòng (loại). Nếu không đủ, fallback toàn shop."""
+    if not META_PROD:
+        return None, None
+    cat = _category_key_from_doc(base_doc)
+    def same_cat(x):
+        return _category_key_from_doc(x) == cat
+    cands = [x for x in META_PROD if same_cat(x)]
+    if len(cands) < 2:
+        cands = [x for x in META_PROD]  # fallback toàn shop
+
+    items = []
+    for x in cands:
+        pv = _price_value(x)
+        if pv is not None:
+            items.append((pv, x))
+    if not items:
+        return None, None
+
+    # loại chính ra khỏi candidates nếu trùng URL hoặc title
+    def is_same(a, b):
+        return (a.get("url") and a.get("url")==b.get("url")) or \
+               ((a.get("title") or "").strip().lower()==(b.get("title") or "").strip().lower())
+
+    items = [(p, x) for (p, x) in items if not is_same(x, base_doc)]
+    if not items:
+        return None, None
+
+    items.sort(key=lambda t: t[0])
+    low = items[0][1]
+    high = items[-1][1]
+    return low, high
+
 
 def _extract_features_from_text(text_block: str):
     lines = []
@@ -865,45 +992,98 @@ def should_relax_filter(q: str, hits: list) -> bool:
 
 # ====== Compose trả lời ======
 def compose_product_reply(hits, lang: str = "vi"):
+    if not hits:
+        return t(lang, "fallback")
+
+    # Ưu tiên currency trong meta; nếu không có, mặc định ₫ cho VI
+    currency = (hits[0].get("currency") or ("₫" if lang == "vi" else ""))
+
     items = []
     for d in hits[:2]:
-        title   = d.get("title") or "Sản phẩm"
-        price   = d.get("price")
-        variant = d.get("variant")
-        stock   = _stock_line(d)
+        title     = d.get("title") or "Sản phẩm"
+        variant   = d.get("variant")
+        stock     = _stock_line(d)
+
+        price_val = _price_value(d)
+        price_str = _fmt_price(price_val, currency) if price_val is not None else None
+
         line = f"• {title}"
-        if variant: line += f" ({variant})"
-        if price:   line += f" — {price} đ"
+        if variant:
+            line += f" ({variant})"
+        if price_str:
+            line += f" — {price_str}"
         line += f" — {stock}"
         items.append(line)
-    if not items:
-        return t(lang, "fallback")
+
     raw = f"{t(lang,'suggest_hdr')}\n" + "\n".join(items) + "\n\n" + t(lang,"product_pts")
     return rephrase_casual(raw, intent="product", lang=lang)
 
 def compose_product_info(hits, lang: str = "vi"):
     if not hits:
         return t(lang, "fallback")
+
     d = hits[0]
-    title = d.get("title") or "Sản phẩm"
-    price = d.get("price")
-    stock = _stock_line(d)
+    currency   = d.get("currency") or ("₫" if lang == "vi" else "")
+    title      = d.get("title") or "Sản phẩm"
+    stock      = _stock_line(d)
+
+    price_val  = _price_value(d)
+    price_line = f"Giá tham khảo: {_fmt_price(price_val, currency)}" if price_val is not None else ""
+
     bullets = _extract_features_from_text(d.get("text",""))
-    body = "\n".join(bullets) if bullets else "• Thiết kế tối giản, dễ phối đồ\n• Chất liệu thoáng, dễ vệ sinh"
-    price_line = f"Giá tham khảo: {price} đ" if price else ""
-    raw = (
-        f"{t(lang,'highlights', title=title)}\n"
-        f"{body}\n"
-        f"{price_line}\n"
-        f"Tình trạng: {stock}\n"
-        f"{t(lang,'product_pts')}"
-    ).strip()
+    body    = "\n".join(bullets) if bullets else "• Thiết kế tối giản, dễ phối đồ\n• Chất liệu thoáng, dễ vệ sinh"
+
+    parts = [
+        f"{t(lang,'highlights', title=title)}",
+        body
+    ]
+    if price_line:
+        parts.append(price_line)
+    parts.extend([
+        f"Tình trạng: {stock}",
+        t(lang,"product_pts")
+    ])
+
+    raw = "\n".join(parts).strip()
     return rephrase_casual(raw, intent="product", lang=lang)
+
 
 def compose_contextual_answer(context, question, history):
     msgs = build_messages(SYSTEM_STYLE, history, context, question)
     _, reply = call_openai(msgs, temperature=0.6)
     return reply
+
+def compose_price_with_suggestions(hits, lang: str = "vi"):
+    if not hits:
+        return t(lang, "fallback"), []
+
+    main = hits[0]
+    currency = main.get("currency") or ("₫" if lang == "vi" else "")
+    main_price = _price_value(main)
+    main_price_str = _fmt_price(main_price, currency) if main_price is not None else "đang cập nhật"
+
+    low, high = _minmax_in_category(main)
+
+    lines = []
+    title = main.get("title") or "Sản phẩm"
+    lines.append(f"Vâng ạ, **{title}** đang được shop bán với **giá công khai: {main_price_str}**.")
+    sug = []
+    if high:
+        hp = _fmt_price(_price_value(high), currency)
+        sug.append(f"• **Cùng dòng – giá cao nhất:** {high.get('title','SP')} — {hp}")
+    if low:
+        lp = _fmt_price(_price_value(low), currency)  # đã sửa _ue → _price_value
+        sug.append(f"• **Cùng dòng – giá thấp nhất:** {low.get('title','SP')} — {lp}")
+
+    if sug:
+        lines.append("Bạn cũng có thể tham khảo thêm:")
+        lines += sug
+    lines.append(t(lang, "product_pts"))
+    raw = "\n".join(lines)
+
+    btns = [x for x in (high, low) if x]
+    return rephrase_casual(raw, intent="product", lang=lang), btns[:2]
+
 
 def answer_with_rag(user_id, user_question):
     s = _get_sess(user_id)
@@ -913,22 +1093,19 @@ def answer_with_rag(user_id, user_question):
     lang = detect_lang(user_question)
     print(f"🔎 intent={intent} | 🗣️ lang={lang}")
 
-  # trong answer_with_rag, ngay sau print(...)
+    # ——— QUICK ROUTES ———
     if intent == "greet":
         return greet_text(lang), []
-
-    if intent == "smalltalk":               # <-- đưa smalltalk lên trước
+    if intent == "smalltalk":
         return handle_smalltalk(user_question, lang=lang), []
-
     if intent == "browse":
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
         return t(lang, "browse", url=url), []
-
     if intent == "new_items":
         items = get_new_arrivals(days=30, topk=4)
         return compose_new_arrivals(lang=lang, items=items), items[:2]
 
-
+    # ——— PRODUCT SEARCH ———
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
     best = max(prod_scores or [0.0])
 
@@ -937,32 +1114,58 @@ def answer_with_rag(user_id, user_question):
         print("🔧 relaxed_filter=True (fallback to unfiltered hits)")
         filtered_hits = prod_hits
 
-    print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}")
-    context = retrieve_context(user_question, topk=6)
+    # So khớp tiêu đề tính trên TOÀN BỘ prod_hits
+    title_ok = _has_title_overlap(user_question, prod_hits)
 
+    # Nếu gần đúng tiêu đề hoặc có hit → coi như intent=product
+    if intent == "other" and (filtered_hits or title_ok):
+        intent = "product"
+
+    # Nếu trùng tiêu đề nhưng filtered rỗng → dùng lại prod_hits
+    if title_ok and not filtered_hits:
+        filtered_hits = prod_hits
+
+    print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
+
+    # ——— CONTEXT/POLICY ———
+    context = retrieve_context(user_question, topk=6)
     if intent == "policy" and context:
         ans = compose_contextual_answer(context, user_question, hist)
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
 
+    # ——— ƯU TIÊN HỎI GIÁ ———
+    if is_price_question(user_question, lang) and (filtered_hits or title_ok):
+        print("➡️ route=price_question→price_with_suggestions")
+        chosen = filtered_hits if filtered_hits else prod_hits
+        reply, sug_hits = compose_price_with_suggestions(chosen, lang=lang)
+        return reply, sug_hits
+
+    # ——— PRODUCT BRANCHES ———
     if intent in {"product", "product_info"}:
-        if not filtered_hits or best < SCORE_MIN:
+        # Không có hit hoặc score thấp & không trùng tiêu đề → OOS/fallback link
+        if not filtered_hits or (best < SCORE_MIN and not title_ok):
             url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
-            return (t(lang, "oos", url=url)), []
+            print("➡️ route=oos_hint")
+            return t(lang, "oos", url=url), []
 
     if intent == "product_info":
+        print("➡️ route=product_info")
         return compose_product_info(filtered_hits, lang=lang), filtered_hits[:1]
 
-    if intent in {"product","other"} and filtered_hits and best >= SCORE_MIN:
+    if intent in {"product", "other"} and filtered_hits and (best >= SCORE_MIN or title_ok):
+        print("➡️ route=product_reply")
         return compose_product_reply(filtered_hits, lang=lang), filtered_hits[:2]
 
+    # ——— CONTEXT FALLBACK ———
     if context:
         ans = compose_contextual_answer(context, user_question, hist)
+        print("➡️ route=ctx_fallback")
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
-    
-    
 
-    return (t(lang, "fallback")), []
+    print("➡️ route=fallback")
+    return t(lang, "fallback"), []
+
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
