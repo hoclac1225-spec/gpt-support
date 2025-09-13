@@ -114,16 +114,18 @@ def _has_title_overlap(q: str, hits: list, min_words: Optional[int] = None, min_
     syn_tokens |= {_zh_compat(t) for t in syn_tokens}
 
     # 0) Nếu thấy bất kỳ token đồng nghĩa nào xuất hiện trong tiêu đề → pass
-    for d in hits[:TITLE_MAX_CHECK]:
-        t1, t2 = _norm_both(d.get("title", ""))
-        t1c, t2c = _zh_compat(t1), _zh_compat(t2)
-        h1_ns, h2_ns = t1.replace(" ",""), t2.replace(" ","")
-        h1c_ns, h2c_ns = t1c.replace(" ",""), t2c.replace(" ","")
-        if any((t in t1) or (t in t2) or (t in t1c) or (t in t2c) or
-               (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns) or
-               (t.replace(" ","") in h1c_ns) or (t.replace(" ","") in h2c_ns)
-               for t in syn_tokens):
-            return True
+    TITLE_ALLOW_SYNONYM_PASS = os.getenv("TITLE_ALLOW_SYNONYM_PASS", "false").lower() == "true"
+    if TITLE_ALLOW_SYNONYM_PASS:
+        for d in hits[:TITLE_MAX_CHECK]:
+            t1, t2 = _norm_both(d.get("title", ""))
+            t1c, t2c = _zh_compat(t1), _zh_compat(t2)
+            h1_ns, h2_ns  = t1.replace(" ",""), t2.replace(" ","")
+            h1c_ns, h2c_ns = t1c.replace(" ",""), t2c.replace(" ","")
+            if any((t in t1) or (t in t2) or (t in t1c) or (t in t2c) or
+                (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns) or
+                (t.replace(" ","") in h1c_ns) or (t.replace(" ","") in h2c_ns)
+                for t in syn_tokens):
+                return True
 
     # 1) So theo từ nếu là ngôn ngữ có khoảng trắng
     for d in hits[:TITLE_MAX_CHECK]:
@@ -277,15 +279,15 @@ SESS_MAX = int(os.getenv("SESS_MAX", "2000"))
 
 def _purge_sessions():
     now = time.time()
-    # xoá hết session hết hạn
-    expired = [k for k,v in SESS.items() if now - v.get("ts",0) > SESSION_TTL]
-    for k in expired:
-        SESS.pop(k, None)
-    # nếu vẫn vượt quá SESS_MAX → LRU trim
-    if len(SESS) > SESS_MAX:
-        extra = len(SESS) - SESS_MAX
-        for k,_ in sorted(SESS.items(), key=lambda kv: kv[1].get("ts",0))[:extra]:
+    with SESS_LOCK:  # <— thêm lock
+        expired = [k for k,v in SESS.items() if now - v.get("ts",0) > SESSION_TTL]
+        for k in expired:
             SESS.pop(k, None)
+        if len(SESS) > SESS_MAX:
+            extra = len(SESS) - SESS_MAX
+            for k,_ in sorted(SESS.items(), key=lambda kv: kv[1].get("ts",0))[:extra]:
+                SESS.pop(k, None)
+
 
 def _get_sess(user_id):
     now = time.time()
@@ -310,15 +312,25 @@ def _remember(user_id, role, text):
 
 # ========= OPENAI WRAPPER =========
 def _to_chat_messages(messages):
-    """Chuyển format responses -> chat.completions để fallback."""
+    """Chuyển format responses -> chat.completions; chịu được cả content là string."""
     chat_msgs = []
-    ALLOWED = {"input_text", "output_text", "text"}  # <-- thêm output_text
+    ALLOWED = {"input_text", "output_text", "text"}
     for m in messages:
         role = m.get("role", "user")
-        parts = m.get("content", [])
-        text = "\n".join([p.get("text","") for p in parts if p.get("type") in ALLOWED]).strip()
+        parts = m.get("content", "")
+        if isinstance(parts, str):
+            text = parts
+        elif isinstance(parts, list):
+            text = "\n".join(
+                p.get("text", "")
+                for p in parts
+                if isinstance(p, dict) and p.get("type") in ALLOWED
+            ).strip()
+        else:
+            text = str(parts) or ""
         chat_msgs.append({"role": role, "content": text})
     return chat_msgs
+
 
 
 def call_openai(messages, temperature=0.7):
@@ -512,19 +524,23 @@ def _safe_read_index(prefix):
 IDX_PROD, META_PROD = _safe_read_index("products")
 IDX_POL,  META_POL  = _safe_read_index("policies")
 
+VEC_LOCK = threading.RLock()
+# ...
 def _reload_vectors():
     global IDX_PROD, META_PROD, IDX_POL, META_POL
     try:
-        IDX_PROD, META_PROD = _safe_read_index("products")
-        IDX_POL,  META_POL  = _safe_read_index("policies")
-        ok = (IDX_PROD is not None or IDX_POL is not None)
-        print("🔄 Reload vectors:", ok,
-              "| prod_chunks=", (len(META_PROD) if META_PROD else 0),
-              "| policy_chunks=", (len(META_POL) if META_POL else 0))
+        idxp, metap = _safe_read_index("products")
+        idxk, metak = _safe_read_index("policies")
+        ok = (idxp is not None or idxk is not None)
+        with VEC_LOCK:
+            IDX_PROD, META_PROD = idxp, metap
+            IDX_POL,  META_POL  = idxk, metak
+        print("🔄 Reload vectors:", ok, "| prod_chunks=", len(metap or []), "| policy_chunks=", len(metak or []))
         return ok
     except Exception as e:
         print("❌ reload vectors:", repr(e))
         return False
+
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
@@ -674,18 +690,52 @@ def _keyword_fallback(query: str, topk: int = None):
         hits = filt
 
     return hits, [1.0] * len(hits)
+# --- Exact/substring match theo tiêu đề (ưu tiên tuyệt đối) ---
+def _exactish_title_hits(query: str, limit: int = 8):
+    if not META_PROD:
+        return []
+    qn1, qn2 = _norm_both(query)
+    if not (qn1 or qn2):
+        return []
+    qn1c, qn2c = _zh_compat(qn1), _zh_compat(qn2)
+    qn1_ns, qn2_ns = qn1.replace(" ", ""), qn2.replace(" ", "")
+    qn1c_ns, qn2c_ns = qn1c.replace(" ", ""), qn2c.replace(" ", "")
+
+    hits = []
+    for d in META_PROD:
+        t1, t2 = _norm_both(d.get("title", ""))
+        t1c, t2c = _zh_compat(t1), _zh_compat(t2)
+        t1_ns, t2_ns = t1.replace(" ", ""), t2.replace(" ", "")
+        t1c_ns, t2c_ns = t1c.replace(" ", ""), t2c.replace(" ", "")
+
+        # exact hoặc substring đủ dài (≥ 6 kí tự sau normalize)
+        cond = (
+            (qn1 and (qn1 == t1 or (len(qn1) >= 6 and qn1 in t1))) or
+            (qn2 and (qn2 == t2 or (len(qn2) >= 6 and qn2 in t2))) or
+            (qn1c and (qn1c == t1c or (len(qn1c) >= 6 and qn1c in t1c))) or
+            (qn2c and (qn2c == t2c or (len(qn2c) >= 6 and qn2c in t2c))) or
+            (qn1_ns and qn1_ns in t1_ns) or
+            (qn2_ns and qn2_ns in t2_ns) or
+            (qn1c_ns and qn1c_ns in t1c_ns) or
+            (qn2c_ns and qn2c_ns in t2c_ns)
+        )
+        if cond:
+            hits.append(d)
+            if len(hits) >= limit:
+                break
+    return hits
 
 
 def search_products_with_scores(query, topk=8):
-    """
-    1) FAISS trước
-    2) Nếu không có hit hoặc best < KEYWORD_FALLBACK_TH (và—nếu bật—chỉ khi là CJK)
-       → fallback quét META theo từ khóa/đồng nghĩa (bắt cả ZH/TW)
-    """
-    # Index chưa có → fallback ngay
+    # 0) ƯU TIÊN exact/substring theo TITLE
+    fast = _exactish_title_hits(query, limit=topk)
+    if fast:
+        print(f"🎯 exact-title hits: {len(fast)}")
+        return fast, [1.0] * len(fast)
+
+    # 1) FAISS
     if IDX_PROD is None:
         return _keyword_fallback(query, topk)
-
     v = _embed_query(query)
     if v is None:
         return _keyword_fallback(query, topk)
@@ -1573,11 +1623,9 @@ def answer_with_rag(user_id, user_question):
 
     title_ok = _has_title_overlap(user_question, prod_hits)
 
-    if intent == "other" and (filtered_hits or title_ok):
+    # Chỉ chuyển sang product nếu thật sự mạnh (qua score gate) và có hit sau lọc
+    if intent == "other" and filtered_hits and ok_by_score:
         intent = "product"
-
-    if title_ok and not filtered_hits:
-        filtered_hits = prod_hits
 
     print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
 
@@ -1866,4 +1914,5 @@ if __name__ == "__main__":
         _start_vector_watcher()
     port = int(os.getenv("PORT", 3000))
     print(f"🚀 Starting app on 0.0.0.0:{port}")
-    # app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
+
