@@ -54,6 +54,36 @@ def _char_ngrams(s: str, n=2):
         return {s}
     return {s[i:i+n] for i in range(len(s)-n+1)}
 
+# --- Cross-language helpers ---
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+def _any_cjk(s: str) -> bool:
+    return bool(CJK_RE.search(s or ""))
+
+def _cjk_in_hits(hits, k=None) -> bool:
+    if k is None:
+        k = TITLE_MAX_CHECK
+    for d in hits[:k]:
+        if _any_cjk(d.get("title")) or _any_cjk(d.get("tags")) or _any_cjk(d.get("product_type")):
+            return True
+    return False
+
+def _score_gate(q: str, hits: list, best: float) -> bool:
+    """
+    Trả về True nếu best score đủ tốt sau khi áp dụng ngưỡng động.
+    - Câu ngắn: hạ 0.05
+    - Danh mục/tiêu đề ZH (chéo ngôn ngữ): hạ 0.08
+    - Sàn tối thiểu: 0.18
+    """
+    th = SCORE_MIN
+    if len(_normalize_text(q).split()) <= 3:
+        th -= 0.05
+    if _any_cjk(q) or _cjk_in_hits(hits):
+        th -= 0.08
+    th = max(0.18, th)
+    return best >= th
+
+
 # --- Title overlap config (đặt ở cấp module, sau load_dotenv) ---
 TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "2"))
 TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.25"))
@@ -826,7 +856,7 @@ POLICY_KEYWORDS  = {"chính sách","đổi trả","bảo hành","ship","vận ch
 PRODUCT_KEYWORDS = {
     "mua","bán","giá","size","kích thước","chất liệu","màu","hợp","phù hợp",
     "dây","đồng hồ","vòng","case","áo","quần","áo phông","tshirt","t-shirt","áo thun",
-    "sản phẩm", "bánh","crepe","bánh crepe","bánh sầu riêng","milktea","trà sữa"
+    "sản phẩm","sp","bánh","crepe","bánh crepe","bánh sầu riêng","milktea","trà sữa"
 }
 BROWSE_KEYWORDS  = {"có những gì","bán gì","có gì","danh mục","catalog","xem hàng","tham quan","xem shop","xem sản phẩm","shop có gì","những sản phẩm gì"}
 _BROWSE_PATTERNS = [
@@ -851,7 +881,9 @@ def detect_intent(text: str):
 
     # browse: từ khóa + pattern chung
     if any(k in t0 for k in BROWSE_KEYWORDS):  return "browse"
-    if any(re.search(p, t0) for p in _BROWSE_PATTERNS):     return "browse"
+    if any(re.search(p, t0, flags=re.I) for p in _BROWSE_PATTERNS):
+        return "browse"
+
 
     # hỏi hàng mới đa ngôn ngữ
     if any(re.search(p, raw, flags=re.I) for p in _pat(NEW_ITEMS_PATTERNS, lang)):
@@ -1306,9 +1338,12 @@ def answer_with_rag(user_id, user_question):
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
     best = max(prod_scores or [0.0])
 
+    ok_by_score = _score_gate(user_question, prod_hits, best)
+
+
     filtered_hits = filter_hits_by_query(prod_hits, user_question, lang=lang) if STRICT_MATCH else prod_hits
-    if STRICT_MATCH and not filtered_hits and should_relax_filter(user_question, prod_hits):
-        print("🔧 relaxed_filter=True (fallback to unfiltered hits)")
+    # nếu STRICT_MATCH làm rỗng mà catalog là ZH → nới lọc
+    if STRICT_MATCH and not filtered_hits and (_any_cjk(user_question) or _cjk_in_hits(prod_hits)):
         filtered_hits = prod_hits
 
     title_ok = _has_title_overlap(user_question, prod_hits)
@@ -1321,41 +1356,52 @@ def answer_with_rag(user_id, user_question):
 
     print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
 
-    # ——— CONTEXT/POLICY ———
+        # --- CONTEXT/POLICY ---
     context = retrieve_context(user_question, topk=6)
-    # Nhánh policy:
     if intent == "policy" and context:
         ans = compose_contextual_answer(context, user_question, hist, lang=lang)
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
 
-    # ——— ƯU TIÊN HỎI GIÁ ———
+    # --- ƯU TIÊN HỎI GIÁ ---
     if is_price_question(user_question, lang) and (filtered_hits or title_ok):
         print("➡️ route=price_question→price_with_suggestions")
         chosen = filtered_hits if filtered_hits else prod_hits
         reply, sug_hits = compose_price_with_suggestions(chosen, lang=lang)
         return reply, sug_hits
 
-    # ——— PRODUCT BRANCHES ———
-    if intent in {"product", "product_info"}:
-        if not filtered_hits or (best < SCORE_MIN and not title_ok):
-            url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
-            print("➡️ route=oos_hint")
-            return t(lang, "oos", url=url), []
+    # --- PRODUCT BRANCHES ---
+    # (nếu bạn đã thêm ok_by_score theo patch trước, dùng nó; chưa có thì thay ok_by_score bằng (best >= SCORE_MIN))
+    not_enough = (not filtered_hits) or (not ok_by_score and not title_ok)
+
+    if intent in {"product", "product_info"} and not_enough:
+        # 1) Có context → dùng LLM + context
+        if context:
+            print("➡️ route=ctx_fallback_from_product")
+            ans = compose_contextual_answer(context, user_question, hist, lang=lang)
+            return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
+        # 2) Không có context → LLM trơn (shop_identity vẫn được chèn trong compose_contextual_answer)
+        if ALWAYS_ANSWER:
+            print("➡️ route=llm_fallback_from_product")
+            ans = compose_contextual_answer("", user_question, hist, lang=lang)
+            return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
+        # 3) Cuối cùng mới rơi về OOS
+        url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
+        print("➡️ route=oos_hint")
+        return t(lang, "oos", url=url), []
 
     if intent == "product_info":
         print("➡️ route=product_info")
         return compose_product_info(filtered_hits, lang=lang), filtered_hits[:1]
 
-    if intent in {"product", "other"} and filtered_hits and (best >= SCORE_MIN or title_ok):
+    if intent in {"product", "other"} and filtered_hits and (ok_by_score or title_ok):
         print("➡️ route=product_reply")
         return compose_product_reply(filtered_hits, lang=lang), filtered_hits[:2]
 
-    # ——— CONTEXT FALLBACK ———
-    # Nhánh context fallback:
+    # --- CONTEXT FALLBACK CHUNG ---
     if context:
-        ans = compose_contextual_answer(context, user_question, hist, lang=lang)
         print("➡️ route=ctx_fallback")
+        ans = compose_contextual_answer(context, user_question, hist, lang=lang)
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
 
     print("➡️ route=fallback")
@@ -1491,14 +1537,21 @@ def api_product_search():
     lang = detect_lang(q)
     hits, scores = search_products_with_scores(q, topk=8)
     best = max(scores or [0.0])
+
     kept = filter_hits_by_query(hits, q, lang=lang) if STRICT_MATCH else hits
     if STRICT_MATCH and not kept and should_relax_filter(q, hits):
         kept = hits
-    if not kept or best < SCORE_MIN:
+
+    ok_by_score = _score_gate(q, hits, best)
+    title_ok = _has_title_overlap(q, hits)
+
+    if not kept or (not ok_by_score and not title_ok):
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
         return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
+
     reply = compose_product_reply(kept, lang=lang)
     return jsonify({"ok": True, "reply": reply, "items": kept[:2]})
+
 
 # ========= IG OAuth callback & policy pages =========
 @app.route("/auth/callback")
