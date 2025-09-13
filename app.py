@@ -56,6 +56,16 @@ def _char_ngrams(s: str, n=2):
 
 # --- Cross-language helpers ---
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+# --- ZH compat: chuyển một số ký tự Phồn thể -> Giản thể để so khớp
+_ZH_T2S = str.maketrans({
+    "錶":"表","鐘":"钟","帶":"带","鏈":"链","鋼":"钢","膠":"胶","殼":"壳","護":"护","貼":"贴",
+    "滿":"满","鏡":"镜","頭":"头","機":"机","臺":"台","檔":"档","質":"质","適":"适","極":"极",
+    "鬆":"松","顯":"显","內":"内","顆":"颗","營":"营","現":"现","網":"网","聯":"联","門":"门",
+    "開":"开","廣":"广","電":"电","舊":"旧","雜":"杂","據":"据","錄":"录","幀":"帧",
+})
+
+def _zh_compat(s: str) -> str:
+    return (s or "").translate(_ZH_T2S)
 
 def _any_cjk(s: str) -> bool:
     return bool(CJK_RE.search(s or ""))
@@ -92,13 +102,14 @@ TITLE_MAX_CHECK = int(os.getenv("TITLE_MAX_CHECK", "5"))
 def _has_title_overlap(
     q: str,
     hits: list,
-    min_words: Optional[int] = None,   # nếu dùng Python 3.10+ có thể dùng: int | None
+    min_words: Optional[int] = None,
     min_cover: float = 0.6
 ) -> bool:
     """
-    Kiểm tra mức trùng khớp giữa câu hỏi và title các hit.
-    - Ngôn ngữ có khoảng trắng: yêu cầu số từ trùng tối thiểu (TITLE_MIN_WORDS) hoặc tỉ lệ phủ >= min_cover.
-    - CJK/không có khoảng trắng: dùng bigram ký tự với ngưỡng TITLE_CJK_MIN_COVER.
+    So khớp tiêu đề với câu hỏi:
+    - Ngôn ngữ có khoảng trắng: dựa vào số từ trùng tối thiểu (min_words) hoặc tỉ lệ phủ >= min_cover.
+    - CJK/không khoảng trắng/chuỗi rất ngắn: dùng n-gram ký tự (bigrams) + bản chuyển TW→CN.
+    - Trả về True nếu *bất kỳ* tiêu đề nào trong hits (tối đa TITLE_MAX_CHECK) đạt điều kiện.
     """
     if not q or not hits:
         return False
@@ -106,35 +117,54 @@ def _has_title_overlap(
     if min_words is None:
         min_words = TITLE_MIN_WORDS
 
+    # Chuẩn hoá câu hỏi
     qn1, qn2 = _norm_both(q)
-    qtok = [w for w in qn1.split() if len(w) > 1]
+    qtok = [w for w in qn1.split() if len(w) > 1]  # token theo từ
+    is_cjk = _any_cjk(qn1)                         # có ký tự CJK?
 
-    # CJK/không có khoảng trắng → so trùng bigram ký tự
-    if not qtok or re.search(r"[\u4e00-\u9fff]", q):
-        qgrams = _char_ngrams(qn1, 2) | _char_ngrams(qn2, 2)
-        if not qgrams:
-            return False
-        for d in hits[:TITLE_MAX_CHECK]:
-            t1, t2 = _norm_both(d.get("title", ""))
-            tgrams = _char_ngrams(t1, 2) | _char_ngrams(t2, 2)
-            cover = len(qgrams & tgrams) / max(1, len(qgrams))
-            if cover >= TITLE_CJK_MIN_COVER:
-                return True
-        return False
+    # Chuẩn bị n-grams ký tự cho các trường hợp cần (CJK hoặc câu rất ngắn)
+    qgrams: set = set()
+    if is_cjk or len(qtok) <= 1:
+        for s in (qn1, qn2, _zh_compat(qn1), _zh_compat(qn2)):
+            qgrams |= _char_ngrams(s, 2)
 
-    # Ngôn ngữ có khoảng trắng → so theo từ
+    # Duyệt các hit (giới hạn để tránh tốn CPU)
     for d in hits[:TITLE_MAX_CHECK]:
-        t1, t2 = _norm_both(d.get("title", ""))
+        title = (d.get("title") or "").strip()
+        if not title:
+            continue
+
+        t1, t2 = _norm_both(title)
+
+        # ---- 1) So theo từ (ngôn ngữ có khoảng trắng)
         matched = sum(1 for w in qtok if (w in t1) or (w in t2))
-        cond_min_words = (len(qtok) >= min_words and matched >= min_words)
-        cond_cover = (matched / max(1, len(qtok))) >= min_cover
-        if cond_min_words or cond_cover:
+        ok_words = False
+        if qtok:
+            cond_min_words = (len(qtok) >= min_words and matched >= min_words)
+            cond_cover = (matched / max(1, len(qtok))) >= min_cover
+            ok_words = cond_min_words or cond_cover
+
+        # ---- 2) So theo ký tự (CJK / câu rất ngắn / không khoảng trắng)
+        ok_cjk = False
+        if qgrams:
+            # thêm bản TW→CN của tiêu đề vào n-grams
+            t1c, t2c = _zh_compat(t1), _zh_compat(t2)
+            tgrams = _char_ngrams(t1, 2) | _char_ngrams(t2, 2) | _char_ngrams(t1c, 2) | _char_ngrams(t2c, 2)
+            if tgrams:
+                cover = len(qgrams & tgrams) / max(1, len(qgrams))
+                th = TITLE_CJK_MIN_COVER
+                # nới ngưỡng cho truy vấn cực ngắn
+                if len(qgrams) <= 3:
+                    th = max(0.18, th - 0.08)
+                ok_cjk = cover >= th
+
+        if ok_words or ok_cjk:
             return True
+
     return False
 
-# (tuỳ chọn) Alias để tương thích nếu trước đây gọi tên hàm là "_"
+# (Alias tương thích)
 _ = _has_title_overlap
-
 # ========= BOOTSTRAP =========
 
 APP_SECRET = os.getenv("FB_APP_SECRET", "")
@@ -219,7 +249,7 @@ REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "true").lower() == "true"
 EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 
 # Lọc & ngưỡng điểm
-SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.28"))
+SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.26"))
 STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
 
 print("=== BOOT ===")
@@ -1136,82 +1166,106 @@ add_syn("台灣", ["臺灣","台湾","taiwan","tw"])
 add_syn("臺灣", ["台灣","台湾","taiwan","tw"])
 add_syn("澳洲", ["australia","úc","au"])
 add_syn("越南", ["vietnam","việt nam","vn"])
-
+add_syn("手錶", ["手表","腕錶","腕表"])
+add_syn("錶帶", ["表带","表帶","錶鏈","表鏈","金屬錶帶","金属表带"])
+add_syn("鋼化膜", ["钢化膜","玻璃貼","玻璃贴","保護貼","保护贴","滿版玻璃","满版玻璃","全膠","全胶"])
+add_syn("手機殼", ["手机壳","保護殼","保护壳","手機套","手机套","背蓋","背盖"])
 
 # --- Bổ sung đồng nghĩa cho shop (TW/繁體) ---
-
-
-
 def _query_tokens(q: str, lang: str = "vi") -> set:
-    """Sinh token từ câu hỏi: có dấu, không dấu, bigram, cụm phrase và synonyms."""
     n1, n2 = _norm_both(q)
-    w1 = [w for w in n1.split() if len(w) > 1]
-    w2 = [w for w in n2.split() if len(w) > 1]
+    w1 = [w for w in re.split(r"\s+", n1) if len(w) > 1]
+    w2 = [w for w in re.split(r"\s+", n2) if len(w) > 1]
 
-    tokens = set(w1) | set(w2)
+    tokens: set[str] = set(w1) | set(w2)
 
-    # bigram cho cả có dấu & không dấu (bắt 'sầu riêng', 'banh sau'...)
+    # Bigrams theo TỪ (có & không dấu) – chỉ làm 1 lần
     for words in (w1, w2):
         for i in range(len(words) - 1):
-            tokens.add((words[i] + " " + words[i+1]).strip())
-            tokens.add((words[i] + words[i+1]).strip())  # biến thể không space
+            a, b = words[i], words[i + 1]
+            tokens.add(f"{a} {b}")
+            tokens.add(f"{a}{b}")  # biến thể không space
 
+    # n-gram theo KÝ TỰ cho CJK (2 & 3), kèm TW→CN
+    if _any_cjk(q):
+        base  = re.sub(r"\s+", "", _normalize_text(q))
+        basec = _zh_compat(base)
+        for s in (base, basec):
+            L = len(s)
+            if L >= 2:
+                tokens.update(s[i:i+2] for i in range(L - 1))
+            if L >= 3:
+                tokens.update(s[i:i+3] for i in range(L - 2))
+
+    # Cụm phrase đặc thù theo ngôn ngữ
     combo_phrases = {
         "vi": ["đồng hồ","dây đồng hồ","kính cường lực","ốp lưng","áo thun","áo phông","bánh crepe","bánh sầu riêng","trà sữa"],
         "en": ["watch band","screen protector","phone case","t shirt","t-shirt","mille crepe","durian crepe","milk tea","bubble tea","boba tea"],
-        "zh": ["手表","表带","钢化膜","手机壳","T恤","可丽饼","榴莲千层","奶茶","珍珠奶茶"],
+        "zh": ["手表","表带","钢化膜","手机壳","T恤","可丽饼","榴莲千层","奶茶","珍珠奶茶","手錶","錶帶","鋼化膜","手機殼","可麗餅","榴槤千層","玻璃貼","保護貼","滿版玻璃"],
         "th": ["นาฬิกา","สายนาฬิกา","ฟิล์มกระจก","เคสโทรศัพท์","เสื้อยืด","เครป","เครปทุเรียน","ชานมไข่มุก"],
-        "id": ["jam tangan","tali jam","pelindung layar","casing hp","kaos","kue crepe","crepe durian","teh susu","bubble tea","boba"]
+        "id": ["jam tangan","tali jam","pelindung layar","casing hp","kaos","kue crepe","crepe durian","teh susu","bubble tea","boba"],
     }
 
     joined_n1 = " ".join(w1)
     for phrase in combo_phrases.get(lang, []):
         if phrase in joined_n1:
             p1, p2 = _norm_both(phrase)
-            tokens.update({p1, p2, p1.replace(" ", ""), p2.replace(" ", "")})
+            variants = {p1, p2, p1.replace(" ", ""), p2.replace(" ", "")}
+            # nếu là CJK thì thêm bản TW→CN
+            if _any_cjk(phrase):
+                c1, c2 = _zh_compat(p1), _zh_compat(p2)
+                variants |= {c1, c2, c1.replace(" ", ""), c2.replace(" ", "")}
+            tokens.update(variants)
 
-    # Ánh xạ synonyms (đặt NGOÀI vòng for phrase)
+    # Đồng nghĩa: nếu phát hiện 1 key hay 1 synonym trong câu hỏi → add tất cả biến thể
+    n1_noacc, n2_noacc = n1, n2
     for key, syns in VN_SYNONYMS.items():
         key_n1, key_n2 = _norm_both(key)
-
-        seen = (key_n1 in n1) or (key_n2 in n2)
+        seen = (key_n1 in n1_noacc) or (key_n2 in n2_noacc)
         if not seen:
             for s in syns:
                 s1, s2 = _norm_both(s)
-                if s1 in n1 or s2 in n2:
+                if s1 in n1_noacc or s2 in n2_noacc:
                     seen = True
                     break
-
         if seen:
             for s in [key] + list(syns):
                 s1, s2 = _norm_both(s)
-                tokens.update({s1, s2, s1.replace(" ", ""), s2.replace(" ", "")})
+                cand = {s1, s2, s1.replace(" ", ""), s2.replace(" ", "")}
+                if _any_cjk(s):
+                    c1, c2 = _zh_compat(s1), _zh_compat(s2)
+                    cand |= {c1, c2, c1.replace(" ", ""), c2.replace(" ", "")}
+                tokens.update(cand)
 
-    return {t for t in tokens if len(t) >= 2}
-
-
+    # Loại bỏ rỗng, giữ token dài ≥ 2
+    return {t.strip() for t in tokens if isinstance(t, str) and len(t.strip()) >= 2}
 
 def filter_hits_by_query(hits, q, lang="vi"):
-    """Giữ hit nếu có token/cụm từ câu hỏi xuất hiện trong title/tags/type/variant (có & không dấu)."""
     if not hits:
         return []
     qtoks = _query_tokens(q, lang=lang)
+    # thêm biến thể TW->CN cho token
+    qtoks = qtoks | {_zh_compat(t) for t in qtoks}
 
     kept = []
     for d in hits:
-        hay_raw = " ".join([
-            d.get("title",""), d.get("tags",""), d.get("product_type",""), d.get("variant","")
-        ])
+        hay_raw = " ".join([d.get("title",""), d.get("tags",""), d.get("product_type",""), d.get("variant","")])
         h1, h2 = _norm_both(hay_raw)
-        h1_ns, h2_ns = h1.replace(" ", ""), h2.replace(" ", "")
+        h1c, h2c = _zh_compat(h1), _zh_compat(h2)
+
+        h1_ns, h2_ns   = h1.replace(" ", ""), h2.replace(" ", "")
+        h1c_ns, h2c_ns = h1c.replace(" ", ""), h2c.replace(" ", "")
 
         ok = any(
-            (t in h1) or (t in h2) or (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns)
+            (t in h1) or (t in h2) or (t in h1c) or (t in h2c) or
+            (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns) or
+            (t.replace(" ","") in h1c_ns) or (t.replace(" ","") in h2c_ns)
             for t in qtoks
         )
         if ok:
             kept.append(d)
     return kept
+
 
 
 def should_relax_filter(q: str, hits: list) -> bool:
