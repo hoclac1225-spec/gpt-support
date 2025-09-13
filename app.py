@@ -99,69 +99,66 @@ TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "2"))
 TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.25"))
 TITLE_MAX_CHECK = int(os.getenv("TITLE_MAX_CHECK", "5"))
 
-def _has_title_overlap(
-    q: str,
-    hits: list,
-    min_words: Optional[int] = None,
-    min_cover: float = 0.6
-) -> bool:
-    """
-    So khớp tiêu đề với câu hỏi:
-    - Ngôn ngữ có khoảng trắng: dựa vào số từ trùng tối thiểu (min_words) hoặc tỉ lệ phủ >= min_cover.
-    - CJK/không khoảng trắng/chuỗi rất ngắn: dùng n-gram ký tự (bigrams) + bản chuyển TW→CN.
-    - Trả về True nếu *bất kỳ* tiêu đề nào trong hits (tối đa TITLE_MAX_CHECK) đạt điều kiện.
-    """
+def _has_title_overlap(q: str, hits: list, min_words: Optional[int] = None, min_cover: float = 0.6) -> bool:
     if not q or not hits:
         return False
-
     if min_words is None:
         min_words = TITLE_MIN_WORDS
 
-    # Chuẩn hoá câu hỏi
+    lang = detect_lang(q)
     qn1, qn2 = _norm_both(q)
-    qtok = [w for w in qn1.split() if len(w) > 1]  # token theo từ
-    is_cjk = _any_cjk(qn1)                         # có ký tự CJK?
+    qtok = [w for w in qn1.split() if len(w) > 1]
 
-    # Chuẩn bị n-grams ký tự cho các trường hợp cần (CJK hoặc câu rất ngắn)
-    qgrams: set = set()
-    if is_cjk or len(qtok) <= 1:
-        for s in (qn1, qn2, _zh_compat(qn1), _zh_compat(qn2)):
-            qgrams |= _char_ngrams(s, 2)
+    # dùng đồng nghĩa/biến thể (có cả ZH & TW→CN)
+    syn_tokens = _query_tokens(q, lang=lang)
+    syn_tokens |= {_zh_compat(t) for t in syn_tokens}
 
-    # Duyệt các hit (giới hạn để tránh tốn CPU)
+    # 0) Nếu thấy bất kỳ token đồng nghĩa nào xuất hiện trong tiêu đề → pass
     for d in hits[:TITLE_MAX_CHECK]:
-        title = (d.get("title") or "").strip()
-        if not title:
-            continue
+        t1, t2 = _norm_both(d.get("title", ""))
+        t1c, t2c = _zh_compat(t1), _zh_compat(t2)
+        h1_ns, h2_ns = t1.replace(" ",""), t2.replace(" ","")
+        h1c_ns, h2c_ns = t1c.replace(" ",""), t2c.replace(" ","")
+        if any((t in t1) or (t in t2) or (t in t1c) or (t in t2c) or
+               (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns) or
+               (t.replace(" ","") in h1c_ns) or (t.replace(" ","") in h2c_ns)
+               for t in syn_tokens):
+            return True
 
-        t1, t2 = _norm_both(title)
-
-        # ---- 1) So theo từ (ngôn ngữ có khoảng trắng)
+    # 1) So theo từ nếu là ngôn ngữ có khoảng trắng
+    for d in hits[:TITLE_MAX_CHECK]:
+        t1, t2 = _norm_both(d.get("title", ""))
         matched = sum(1 for w in qtok if (w in t1) or (w in t2))
-        ok_words = False
         if qtok:
             cond_min_words = (len(qtok) >= min_words and matched >= min_words)
             cond_cover = (matched / max(1, len(qtok))) >= min_cover
-            ok_words = cond_min_words or cond_cover
+            if cond_min_words or cond_cover:
+                return True
 
-        # ---- 2) So theo ký tự (CJK / câu rất ngắn / không khoảng trắng)
-        ok_cjk = False
+    # 2) So theo bigram ký tự nếu truy vấn là CJK, HOẶC top hit có CJK, HOẶC câu rất ngắn
+    if _any_cjk(q) or _cjk_in_hits(hits) or len(qtok) <= 1:
+        qgrams = set()
+        for s in (qn1, qn2, _zh_compat(qn1), _zh_compat(qn2)):
+            qgrams |= _char_ngrams(s, 2)
+        # thêm bigram từ các đồng nghĩa CJK
+        for s in [t for t in syn_tokens if _any_cjk(t)]:
+            qgrams |= _char_ngrams(s, 2) | _char_ngrams(_zh_compat(s), 2)
+
         if qgrams:
-            # thêm bản TW→CN của tiêu đề vào n-grams
-            t1c, t2c = _zh_compat(t1), _zh_compat(t2)
-            tgrams = _char_ngrams(t1, 2) | _char_ngrams(t2, 2) | _char_ngrams(t1c, 2) | _char_ngrams(t2c, 2)
-            if tgrams:
+            for d in hits[:TITLE_MAX_CHECK]:
+                t1, t2 = _norm_both(d.get("title", ""))
+                t1c, t2c = _zh_compat(t1), _zh_compat(t2)
+                tgrams = (_char_ngrams(t1,2) | _char_ngrams(t2,2) |
+                          _char_ngrams(t1c,2) | _char_ngrams(t2c,2))
                 cover = len(qgrams & tgrams) / max(1, len(qgrams))
                 th = TITLE_CJK_MIN_COVER
-                # nới ngưỡng cho truy vấn cực ngắn
                 if len(qgrams) <= 3:
                     th = max(0.18, th - 0.08)
-                ok_cjk = cover >= th
-
-        if ok_words or ok_cjk:
-            return True
+                if cover >= th:
+                    return True
 
     return False
+
 
 # (Alias tương thích)
 _ = _has_title_overlap
@@ -249,8 +246,13 @@ REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "true").lower() == "true"
 EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 
 # Lọc & ngưỡng điểm
+# Lọc & ngưỡng điểm
 SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.26"))
 STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
+
+# Kích hoạt fallback khi FAISS không có hit hoặc điểm quá thấp
+KEYWORD_FALLBACK_TH = float(os.getenv("KEYWORD_FALLBACK_TH", "0.20"))
+
 
 print("=== BOOT ===")
 print("VECTOR_DIR:", os.path.abspath(VECTOR_DIR))
@@ -546,15 +548,71 @@ def _embed_query(q: str) -> Optional[np.ndarray]:
         print("⚠️ _embed_query error:", repr(e))
         return None
 
+def _keyword_fallback(query: str, topk: int = 12):
+    """
+    Quét toàn bộ META_PROD bằng token/đồng nghĩa đa ngôn ngữ (có TW->CN).
+    Trả về (hits, scores) – scores giả lập 1.0 để qua _score_gate.
+    """
+    if not META_PROD:
+        return [], []
+
+    lang = detect_lang(query)
+    toks = _query_tokens(query, lang=lang)
+    # thêm bản TW->CN để bắt cả 繁→简
+    toks |= {_zh_compat(t) for t in toks}
+
+    scored = []   # (count_matched, idx)
+    for i, d in enumerate(META_PROD):
+        hay_raw = " ".join([
+            d.get("title",""), d.get("tags",""),
+            d.get("product_type",""), d.get("variant","")
+        ])
+        h1, h2 = _norm_both(hay_raw)
+        h1c, h2c = _zh_compat(h1), _zh_compat(h2)
+        h1_ns, h2_ns   = h1.replace(" ",""),   h2.replace(" ","")
+        h1c_ns, h2c_ns = h1c.replace(" ",""), h2c.replace(" ","")
+
+        c = 0
+        for t in toks:
+            tns = t.replace(" ","")
+            if (t in h1) or (t in h2) or (t in h1c) or (t in h2c) or \
+               (tns in h1_ns) or (tns in h2_ns) or (tns in h1c_ns) or (tns in h2c_ns):
+                c += 1
+        if c > 0:
+            scored.append((c, i))
+
+    if not scored:
+        return [], []
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    idxs = [i for _, i in scored[:topk]]
+
+    # khử trùng lặp theo (url, title)
+    hits, seen = [], set()
+    for i in idxs:
+        d = META_PROD[i]
+        key = (d.get("url"), (d.get("title") or "").lower().strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        hits.append(d)
+
+    return hits, [1.0] * len(hits)  # điểm 1.0 để _score_gate pass
 
 
 def search_products_with_scores(query, topk=8):
+    """
+    1) Tìm bằng FAISS như cũ
+    2) Nếu không có hit hoặc 'best score' < KEYWORD_FALLBACK_TH
+       → fallback quét META theo từ khóa/đồng nghĩa (bắt cả ZH/TW)
+    """
+    # Index chưa có → fallback ngay
     if IDX_PROD is None:
-        return [], []
+        return _keyword_fallback(query, topk)
 
     v = _embed_query(query)
-    if v is None:  # >>> thêm dòng an toàn
-        return [], []
+    if v is None:
+        return _keyword_fallback(query, topk)
 
     try:
         D, I = IDX_PROD.search(v, topk)
@@ -568,11 +626,20 @@ def search_products_with_scores(query, topk=8):
                 seen.add(key)
                 hits.append(d)
                 scores.append(float(score))
-        print(f"📚 product hits: {len(hits)}")
+
+        best = max(scores or [0.0])
+        print(f"📚 product hits: {len(hits)} | best={best:.3f}")
+
+        # Không có hit hoặc điểm quá thấp → dùng keyword fallback
+        if not hits or best < KEYWORD_FALLBACK_TH:
+            print("↪️ FAISS miss/low-score → keyword fallback")
+            return _keyword_fallback(query, topk)
+
         return hits, scores
     except Exception as e:
         print("⚠️ search_products_with_scores:", repr(e))
-        return [], []
+        return _keyword_fallback(query, topk)
+
 def retrieve_context(question, topk=6):
     if IDX_PROD is None and IDX_POL is None:
         return ""
