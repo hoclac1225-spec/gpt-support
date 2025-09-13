@@ -168,6 +168,22 @@ SHOP_URL_MAP = {
     "th": os.getenv("SHOP_URL_TH", SHOP_URL),
     "id": os.getenv("SHOP_URL_ID", SHOP_URL),
 }
+# --- Always-answer & shop identity ---
+ALWAYS_ANSWER = os.getenv("ALWAYS_ANSWER", "true").lower() == "true"
+SHOP_NAME = os.getenv("SHOP_NAME", "Aloha")
+SHOP_BRAND_TAGLINE = os.getenv("SHOP_BRAND_TAGLINE", "Cửa hàng phụ kiện & lifestyle")
+
+def shop_identity(lang: str):
+    url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
+    return (
+        f"SHOP_IDENTITY:\n"
+        f"- Tên/Brand: {SHOP_NAME}\n"
+        f"- Tagline: {SHOP_BRAND_TAGLINE}\n"
+        f"- Website: {url}\n"
+        f"- Ngôn ngữ hỗ trợ: {', '.join(SUPPORTED_LANGS)}\n"
+        f"- Lưu ý: Chỉ nêu GIÁ/TỒN KHO khi có trong CONTEXT; nếu không có dữ kiện thì xin thêm thông tin hoặc dẫn link.\n"
+    )
+
 
 REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "true").lower() == "true"
 EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
@@ -383,12 +399,13 @@ def fb_send_buttons(user_id, text, buttons, page_token):
         "message": {
             "attachment": {
                 "type": "template",
-                "payload": {"template_type": "button", "text": text, "buttons": buttons[:2]}
+                "payload": {"template_type": "button", "text": text, "buttons": buttons[:3]}  # ← cho phép 3 nút
             }
         }
     }
     r = fb_call("/me/messages", payload, page_token=page_token)
     print(f"🔘 ButtonAPI status={getattr(r,'status_code',None)} body={getattr(r,'text','')[:400]}")
+
 
 # === Reload vectors (FAISS) ===
 CANONICAL_DOMAIN = os.getenv("CANONICAL_DOMAIN", SHOP_URL).rstrip("/")
@@ -792,10 +809,11 @@ def is_price_question(text: str, lang: str) -> bool:
 SYSTEM_STYLE = (
     "Bạn là trợ lý bán hàng Aloha tên là Aloha Bot. Tông giọng: thân thiện, chủ động, "
     "trả lời ngắn gọn như người thật; dùng 1–3 emoji hợp ngữ cảnh (không lạm dụng). "
-    "Luôn dựa vào CONTEXT (nội dung RAG). Không bịa. Nếu thiếu dữ liệu thực tế, nói 'mình chưa có dữ liệu' "
-    "và hỏi lại 1 câu để làm rõ. Trình bày dễ đọc: gạch đầu dòng khi liệt kê; 1 câu chốt hành động."
+    "Luôn dựa vào CONTEXT (nội dung RAG). Không bịa. "
+    "KHÔNG được nêu giá/tồn kho/thuộc tính cụ thể nếu CONTEXT không có dữ kiện; "
+    "khi thiếu dữ kiện thì hỏi lại 1 câu làm rõ hoặc mời xem link cửa hàng. "
+    "Trình bày dễ đọc: gạch đầu dòng khi liệt kê; 1 câu chốt hành động."
 )
-
 # FEW_SHOT_EXAMPLES
 FEW_SHOT_EXAMPLES = [
     {"role":"user","content":[{"type":"input_text","text":"helo"}]},
@@ -1226,10 +1244,12 @@ def compose_product_info(hits, lang: str = "vi"):
     return rephrase_casual(raw, intent="product", lang=lang)
 
 
-def compose_contextual_answer(context, question, history):
-    msgs = build_messages(SYSTEM_STYLE, history, context, question)
+def compose_contextual_answer(context, question, history, lang="vi"):
+    ctx = (shop_identity(lang) + "\n" + (context or "")).strip()
+    msgs = build_messages(SYSTEM_STYLE, history, ctx, question)
     _, reply = call_openai(msgs, temperature=0.6)
     return reply
+
 
 def compose_price_with_suggestions(hits, lang: str = "vi"):
     if not hits:
@@ -1303,8 +1323,9 @@ def answer_with_rag(user_id, user_question):
 
     # ——— CONTEXT/POLICY ———
     context = retrieve_context(user_question, topk=6)
+    # Nhánh policy:
     if intent == "policy" and context:
-        ans = compose_contextual_answer(context, user_question, hist)
+        ans = compose_contextual_answer(context, user_question, hist, lang=lang)
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
 
@@ -1331,13 +1352,18 @@ def answer_with_rag(user_id, user_question):
         return compose_product_reply(filtered_hits, lang=lang), filtered_hits[:2]
 
     # ——— CONTEXT FALLBACK ———
+    # Nhánh context fallback:
     if context:
-        ans = compose_contextual_answer(context, user_question, hist)
+        ans = compose_contextual_answer(context, user_question, hist, lang=lang)
         print("➡️ route=ctx_fallback")
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
 
     print("➡️ route=fallback")
+    if ALWAYS_ANSWER:
+        ans = compose_contextual_answer("", user_question, hist, lang=lang)
+        return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
     return t(lang, "fallback"), []
+
 
 # ========= WEBHOOK =========
 @app.route("/webhook", methods=["GET", "POST"])
@@ -1356,7 +1382,6 @@ def webhook():
         print(f"[Webhook][POST] ❌ Invalid signature (UA={ua})")
         return "Invalid signature", 403
 
-
     payload = request.json or {}
     print("[Webhook][POST] 🔔 incoming:", json.dumps(payload)[:500])
 
@@ -1369,65 +1394,70 @@ def webhook():
             continue
 
         for event in entry.get("messaging", []):
-            # bỏ echo của chính page
-            if event.get("message", {}).get("is_echo"):
+            try:
+                # bỏ echo của chính page
+                if event.get("message", {}).get("is_echo"):
+                    continue
+
+                psid = event.get("sender", {}).get("id")
+                if not psid:
+                    continue
+
+                # lấy text từ nhiều nguồn
+                text = None
+                msg = event.get("message", {})
+                pb  = event.get("postback", {})
+
+                if "text" in msg:
+                    text = msg["text"]
+                elif pb.get("payload"):
+                    text = pb["payload"]        # ✅ quan trọng
+                elif msg.get("quick_reply", {}).get("payload"):
+                    text = msg["quick_reply"]["payload"]
+                elif pb.get("title"):
+                    text = pb["title"]
+
+                # nếu không có text → phản hồi nhẹ
+                if not text:
+                    fb_send_text(psid, "Mình đã nhận được tin nhắn (ảnh/file). Bạn mô tả giúp mình nhé 😊", access_token)
+                    continue
+
+                # chống duplicate theo mid
+                mid = msg.get("mid") or pb.get("mid") or str(event.get("timestamp"))
+                sess = _get_sess(psid)
+                if mid and sess.get("last_mid") == mid:
+                    continue
+                sess["last_mid"] = mid
+
+                fb_mark_seen(psid, access_token)
+                fb_typing_on(psid, access_token)
+
+                _remember(psid, "user", text)
+                reply, btn_hits = answer_with_rag(psid, text)
+                lang = detect_lang(text)
+                _remember(psid, "assistant", reply)
+
+                fb_send_text(psid, reply, access_token)
+
+                if btn_hits:
+                    buttons = []
+                    for h in btn_hits[:3]:  # tối đa 3 nút
+                        if h.get("url"):
+                            buttons.append({
+                                "type": "web_url",
+                                "url": h["url"],
+                                "title": (h.get("title") or t(lang, "btn_view"))[:20]
+                            })
+                    if buttons:
+                        fb_send_buttons(psid, t(lang, "quick_view"), buttons, access_token)
+
+            except Exception as e:
+                print("[Webhook][POST] ⚠️ handle event error:", repr(e))
                 continue
 
-            psid = event.get("sender", {}).get("id")
-            if not psid:
-                continue
-
-            text = None
-            if "text" in event.get("message", {}):
-                text = event["message"]["text"]
-            elif event.get("postback", {}).get("payload"):
-                text = event["postback"]["payload"]       # ✅ quan trọng
-            elif event.get("message", {}).get("quick_reply", {}).get("payload"):
-                text = event["message"]["quick_reply"]["payload"]
-            elif event.get("postback", {}).get("title"):
-                text = event["postback"]["title"]
-
-
-            # nếu vẫn không có text, phản hồi nhẹ cho biết đã nhận
-            if not text:
-                fb_send_text(psid, "Mình đã nhận được tin nhắn (ảnh/file). Bạn mô tả giúp mình nhé 😊", access_token)
-                continue
-
-            # chống duplicate theo mid
-            mid = event.get("message", {}).get("mid") \
-                or event.get("postback", {}).get("mid") \
-                or str(event.get("timestamp"))
-
-            sess = _get_sess(psid)
-            if mid and sess.get("last_mid") == mid:
-                continue
-            sess["last_mid"] = mid
-
-
-            fb_mark_seen(psid, access_token)
-            fb_typing_on(psid, access_token)
-
-            _remember(psid, "user", text)
-            reply, btn_hits = answer_with_rag(psid, text)
-            lang = detect_lang(text)
-            _remember(psid, "assistant", reply)
-
-            fb_send_text(psid, reply, access_token)
-
-            if btn_hits:
-                buttons = []
-                for h in btn_hits[:2]:
-                    if h.get("url"):
-                        buttons.append({
-                            "type": "web_url",
-                            "url": h["url"],
-                            "title": (h.get("title") or t(lang, "btn_view"))[:20]
-                        })
-                if buttons:
-                    fb_send_buttons(psid, t(lang, "quick_view"), buttons, access_token)
-
-
+    # ✅ Luôn trả về 200 sau khi xử lý xong tất cả entry/events
     return "ok", 200
+
 
 # ========= API =========
 @app.route("/api/chat", methods=["POST"])
