@@ -2,15 +2,31 @@
 import unicodedata
 import os, json, time, re, requests, numpy as np, faiss, threading, random
 from collections import deque
-from flask import Flask, request, jsonify  # bỏ abort nếu không dùng
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from openai import OpenAI
 import hmac, hashlib, base64
-from typing import Optional  # nếu Python < 3.10 thì dùng Optional
+from typing import Optional
+
+# --- Flask & CORS ---
+app = Flask(__name__)
+CORS(app, resources={
+    r"/api/*": {
+        "origins": [
+            "https://aloha.id.vn",
+            "https://www.aloha.id.vn",
+            "https://9mn9fa-6p.myshopify.com",
+        ],
+        "supports_credentials": True,
+        "allow_headers": ["Content-Type", "Authorization"],
+        "methods": ["GET", "POST", "OPTIONS"],
+    }
+})
 
 # Load .env TRƯỚC khi đọc os.getenv
 load_dotenv()
+
 
 # --- text normalize helpers (có & không dấu)
 def _strip_accents(s: str) -> str:
@@ -91,22 +107,32 @@ _ = _has_title_overlap
 
 # ========= BOOTSTRAP =========
 
-app = Flask(__name__)
-
 APP_SECRET = os.getenv("FB_APP_SECRET", "")
 
-def _verify_fb_sig(req):
-    sig = req.headers.get("X-Hub-Signature-256", "")
-    if not APP_SECRET or not sig.startswith("sha256="):
-        return False
-    digest = hmac.new(APP_SECRET.encode(), req.get_data(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest("sha256=" + digest, sig)
+# Cho phép tạm tắt verify chữ ký khi test nội bộ (đặt trong .env: DISABLE_FB_SIG_VERIFY=true)
+DISABLE_FB_SIG_VERIFY = os.getenv("DISABLE_FB_SIG_VERIFY", "false").lower() == "true"
 
 
-allowed_origins = os.getenv("ALLOWED_ORIGINS", "")
-origins = [o.strip() for o in allowed_origins.split(",")] if allowed_origins else ["*"]
-CORS(app, origins=origins)
+def _verify_fb_sig(req) -> bool:
+    """
+    Hỗ trợ cả X-Hub-Signature-256 (sha256) và X-Hub-Signature (sha1).
+    """
+    if DISABLE_FB_SIG_VERIFY:
+        return True  # chỉ dùng khi test
 
+    sig256 = req.headers.get("X-Hub-Signature-256", "")
+    sig1   = req.headers.get("X-Hub-Signature", "")
+
+    raw = req.get_data()
+    if APP_SECRET and sig256.startswith("sha256="):
+        digest = hmac.new(APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+        return hmac.compare_digest("sha256=" + digest, sig256)
+
+    if APP_SECRET and sig1.startswith("sha1="):
+        digest = hmac.new(APP_SECRET.encode(), raw, hashlib.sha1).hexdigest()
+        return hmac.compare_digest("sha1=" + digest, sig1)
+
+    return False
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "aloha_verify_123")
 # ---- Multi-page map ----
@@ -167,7 +193,7 @@ oai_client   = OpenAI(api_key=OPENAI_API_KEY)
 
 # ========= SMALL IN-MEMORY SESSION =========
 SESS = {}
-SESS_LOCK = threading.Lock()
+SESS_LOCK = threading.RLock()
 SESSION_TTL = 60 * 30  # 30 phút
 SESS_MAX = int(os.getenv("SESS_MAX", "2000"))
 
@@ -197,8 +223,10 @@ def _get_sess(user_id):
         return s
     
 def _remember(user_id, role, text):
-    s = _get_sess(user_id)
-    s["hist"].append({"role": role, "content": text})
+    with SESS_LOCK:
+        s = _get_sess(user_id)
+        s["hist"].append({"role": role, "content": text})
+
 
 
 
@@ -310,6 +338,15 @@ def fb_call(path, payload=None, method="POST", params=None, page_token=None):
     url = f"https://graph.facebook.com/v19.0{path}"
     params = params or {}
     params["access_token"] = page_token
+
+    # appsecret_proof (recommended / required nếu bật)
+    if APP_SECRET:
+        try:
+            proof = hmac.new(APP_SECRET.encode(), page_token.encode(), hashlib.sha256).hexdigest()
+            params["appsecret_proof"] = proof
+        except Exception as e:
+            print("⚠️ cannot compute appsecret_proof:", repr(e))
+
     try:
         r = requests.request(method, url, params=params, json=payload, timeout=15)
         return r
@@ -324,19 +361,34 @@ def fb_typing_on(user_id, page_token):
     fb_call("/me/messages", {"recipient":{"id":user_id}, "sender_action":"typing_on"}, page_token=page_token)
 
 def fb_send_text(user_id, text, page_token):
-    r = fb_call("/me/messages", {"recipient":{"id":user_id}, "message":{"text":text}}, page_token=page_token)
-    print(f"📩 Send text status={getattr(r, 'status_code', None)}")
+    if not page_token:
+        print("❌ missing page_token for fb_send_text")
+        return
+    msg = (text or "").strip()
+    if len(msg) > 1900:  # Messenger khuyến nghị <= ~2000 ký tự
+        msg = msg[:1900] + "…"
+    payload = {
+        "recipient": {"id": user_id},
+        "messaging_type": "RESPONSE",
+        "message": {"text": msg}
+    }
+    r = fb_call("/me/messages", payload, page_token=page_token)
+    print(f"📩 Send text status={getattr(r,'status_code',None)}")
 
 def fb_send_buttons(user_id, text, buttons, page_token):
     if not buttons: return
     payload = {
         "recipient": {"id": user_id},
+        "messaging_type": "RESPONSE",
         "message": {
-            "attachment": {"type": "template","payload": {"template_type": "button","text": text,"buttons": buttons[:2]}}
+            "attachment": {
+                "type": "template",
+                "payload": {"template_type": "button", "text": text, "buttons": buttons[:2]}
+            }
         }
     }
     r = fb_call("/me/messages", payload, page_token=page_token)
-    print(f"🔘 ButtonAPI status={getattr(r,'status_code',None)}")
+    print(f"🔘 ButtonAPI status={getattr(r,'status_code',None)} body={getattr(r,'text','')[:400]}")
 
 # === Reload vectors (FAISS) ===
 CANONICAL_DOMAIN = os.getenv("CANONICAL_DOMAIN", SHOP_URL).rstrip("/")
@@ -405,18 +457,28 @@ def admin_reload_vectors():
     return jsonify({"ok": ok})
 
 
-def _embed_query(q: str) -> np.ndarray:
-    t0 = time.time()
-    resp = oai_client.embeddings.create(model=EMBED_MODEL, input=[q])
-    v = np.array(resp.data[0].embedding, dtype="float32")[None, :]
-    faiss.normalize_L2(v)
-    print(f"🧩 Embedding in {(time.time()-t0)*1000:.0f}ms")
-    return v
+def _embed_query(q: str) -> Optional[np.ndarray]:
+    try:
+        t0 = time.time()
+        resp = oai_client.embeddings.create(model=EMBED_MODEL, input=[q])
+        v = np.array(resp.data[0].embedding, dtype="float32")[None, :]
+        faiss.normalize_L2(v)
+        print(f"🧩 Embedding in {(time.time()-t0)*1000:.0f}ms")
+        return v
+    except Exception as e:
+        print("⚠️ _embed_query error:", repr(e))
+        return None
+
+
 
 def search_products_with_scores(query, topk=8):
     if IDX_PROD is None:
         return [], []
+
     v = _embed_query(query)
+    if v is None:  # >>> thêm dòng an toàn
+        return [], []
+
     try:
         D, I = IDX_PROD.search(v, topk)
         hits, scores, seen = [], [], set()
@@ -434,11 +496,14 @@ def search_products_with_scores(query, topk=8):
     except Exception as e:
         print("⚠️ search_products_with_scores:", repr(e))
         return [], []
-
 def retrieve_context(question, topk=6):
     if IDX_PROD is None and IDX_POL is None:
         return ""
+
     v = _embed_query(question)
+    if v is None:  # >>> thêm dòng an toàn
+        return ""
+
     ctx = []
     if IDX_PROD is not None:
         try:
@@ -456,7 +521,7 @@ def retrieve_context(question, topk=6):
     return "\n\n".join(ctx[:topk]) if ctx else ""
 def _parse_ts(s):
     try:
-        s = (s or "").replace("Z","").replace("T"," ")
+        s = (s or "").replace("Z", "").replace("T", " ")
         return time.mktime(time.strptime(s[:19], "%Y-%m-%d %H:%M:%S"))
     except Exception:
         return 0
@@ -553,6 +618,9 @@ LANG_STRINGS = {
         "smalltalk_hi": "Hi 👋 Mình khỏe nè 😄",
         "smalltalk_askback": "Hôm nay của bạn thế nào?",
         "new_hdr": "Hàng mới về nè ✨",
+        "btn_view": "Xem sản phẩm",
+        "quick_view": "Xem nhanh:",
+
     },
     "en": {
         "greet": "Hello 👋 Happy to help! How can I assist you today? 🙂",
@@ -566,6 +634,8 @@ LANG_STRINGS = {
          "smalltalk_hi": "Hi 👋 I'm good! 😄",
         "smalltalk_askback": "How's your day going?",
         "new_hdr": "New arrivals ✨",
+        "btn_view": "View product",
+        "quick_view": "Quick view:",
     },
     "zh": {
         "greet": "你好 👋 很高兴为你服务！需要我帮你做什么呢？🙂",
@@ -579,6 +649,8 @@ LANG_STRINGS = {
         "smalltalk_hi": "嗨 👋 我很好喔 😄",
         "smalltalk_askback": "你今天过得怎么样？",
         "new_hdr": "新品上架 ✨",
+        "btn_view": "查看商品",
+        "quick_view": "快速查看：",
     },
     "th": {
         "greet": "สวัสดี 👋 ยินดีให้บริการนะครับ/ค่ะ ต้องการให้ช่วยอะไรบ้าง 🙂",
@@ -592,6 +664,8 @@ LANG_STRINGS = {
          "smalltalk_hi": "ไฮ 👋 สบายดีมากเลยนะ 😄",
         "smalltalk_askback": "วันนี้ของคุณเป็นยังไงบ้าง?",
         "new_hdr": "สินค้าเข้าใหม่ ✨",
+        "btn_view": "ดูสินค้า",
+        "quick_view": "ดูด่วน:",
     },
     "id": {
         "greet": "Halo 👋 Senang membantu! Ada yang bisa saya bantu? 🙂",
@@ -605,6 +679,8 @@ LANG_STRINGS = {
        "smalltalk_hi": "Hai 👋 Aku baik-baik saja 😄",
         "smalltalk_askback": "Harinya kamu gimana?",
         "new_hdr": "Produk baru ✨",
+        "btn_view": "Lihat produk",
+        "quick_view": "Lihat cepat:",
     },
 }
 
@@ -1186,9 +1262,6 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
     # Thêm SP chính vào button đầu tiên
     btns = [main] + [x for x in (high, low) if x]
     return rephrase_casual(raw, intent="product", lang=lang), btns[:2]
-
-
-
 def answer_with_rag(user_id, user_question):
     s = _get_sess(user_id)
     hist = s["hist"]
@@ -1218,14 +1291,11 @@ def answer_with_rag(user_id, user_question):
         print("🔧 relaxed_filter=True (fallback to unfiltered hits)")
         filtered_hits = prod_hits
 
-    # So khớp tiêu đề tính trên TOÀN BỘ prod_hits
     title_ok = _has_title_overlap(user_question, prod_hits)
 
-    # Nếu gần đúng tiêu đề hoặc có hit → coi như intent=product
     if intent == "other" and (filtered_hits or title_ok):
         intent = "product"
 
-    # Nếu trùng tiêu đề nhưng filtered rỗng → dùng lại prod_hits
     if title_ok and not filtered_hits:
         filtered_hits = prod_hits
 
@@ -1247,7 +1317,6 @@ def answer_with_rag(user_id, user_question):
 
     # ——— PRODUCT BRANCHES ———
     if intent in {"product", "product_info"}:
-        # Không có hit hoặc score thấp & không trùng tiêu đề → OOS/fallback link
         if not filtered_hits or (best < SCORE_MIN and not title_ok):
             url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
             print("➡️ route=oos_hint")
@@ -1270,70 +1339,93 @@ def answer_with_rag(user_id, user_question):
     print("➡️ route=fallback")
     return t(lang, "fallback"), []
 
-
+# ========= WEBHOOK =========
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    # --- Verify (GET)
     if request.method == "GET":
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
+        print(f"[Webhook][GET] verify_token={token}, challenge={challenge}")
         return (challenge, 200) if token == VERIFY_TOKEN else ("Invalid verification token", 403)
 
-    # POST: verify Facebook signature
-    if not _verify_fb_sig(request):
+    # --- Events (POST)
+    ok_sig = _verify_fb_sig(request)
+    if not ok_sig:
+        ua = request.headers.get("User-Agent", "?")
+        print(f"[Webhook][POST] ❌ Invalid signature (UA={ua})")
         return "Invalid signature", 403
 
-    payload = request.json or {}
 
+    payload = request.json or {}
+    print("[Webhook][POST] 🔔 incoming:", json.dumps(payload)[:500])
+
+    # mỗi entry là 1 trang (page/IG account)
     for entry in payload.get("entry", []):
-        owner_id = str(entry.get("id"))           # Page ID hoặc IG Account ID
+        owner_id = str(entry.get("id"))
         access_token = TOKEN_MAP.get(owner_id)
         if not access_token:
-            print("⚠️ No token mapped for:", owner_id)
+            print(f"[Webhook] ⚠️ No token mapped for owner_id={owner_id}. TOKEN_MAP size={len(TOKEN_MAP)}")
             continue
 
         for event in entry.get("messaging", []):
+            # bỏ echo của chính page
             if event.get("message", {}).get("is_echo"):
                 continue
 
-            if event.get("message") and "text" in event["message"]:
-                psid = event["sender"]["id"]
+            psid = event.get("sender", {}).get("id")
+            if not psid:
+                continue
+
+            text = None
+            if "text" in event.get("message", {}):
                 text = event["message"]["text"]
-                mid  = event["message"].get("mid")
-
-                sess = _get_sess(psid)
-                if mid and sess["last_mid"] == mid:
-                    continue
-                sess["last_mid"] = mid
-
-                fb_mark_seen(psid, access_token)
-                fb_typing_on(psid, access_token)
-
-                _remember(psid, "user", text)
-                reply, btn_hits = answer_with_rag(psid, text)
-                _remember(psid, "assistant", reply)
-
-                fb_send_text(psid, reply, access_token)
-
-                if btn_hits:
-                    buttons = []
-                    for h in btn_hits[:2]:
-                        if h.get("url"):
-                            buttons.append({
-                                "type": "web_url",
-                                "url": h["url"],
-                                "title": (h.get("title") or "Xem sản phẩm")[:20]
-                            })
-                    if buttons:
-                        fb_send_buttons(psid, "Xem nhanh:", buttons, access_token)
-
             elif event.get("postback", {}).get("payload"):
-                psid = event["sender"]["id"]
-                fb_send_text(psid, f"Bạn vừa chọn: {event['postback']['payload']}", access_token)
-
+                text = event["postback"]["payload"]       # ✅ quan trọng
             elif event.get("message", {}).get("quick_reply", {}).get("payload"):
-                psid = event["sender"]["id"]
-                qr_payload = event["message"]["quick_reply"]["payload"]
-                fb_send_text(psid, f"Bạn vừa chọn: {qr_payload}", access_token)
+                text = event["message"]["quick_reply"]["payload"]
+            elif event.get("postback", {}).get("title"):
+                text = event["postback"]["title"]
+
+
+            # nếu vẫn không có text, phản hồi nhẹ cho biết đã nhận
+            if not text:
+                fb_send_text(psid, "Mình đã nhận được tin nhắn (ảnh/file). Bạn mô tả giúp mình nhé 😊", access_token)
+                continue
+
+            # chống duplicate theo mid
+            mid = event.get("message", {}).get("mid") \
+                or event.get("postback", {}).get("mid") \
+                or str(event.get("timestamp"))
+
+            sess = _get_sess(psid)
+            if mid and sess.get("last_mid") == mid:
+                continue
+            sess["last_mid"] = mid
+
+
+            fb_mark_seen(psid, access_token)
+            fb_typing_on(psid, access_token)
+
+            _remember(psid, "user", text)
+            reply, btn_hits = answer_with_rag(psid, text)
+            lang = detect_lang(text)
+            _remember(psid, "assistant", reply)
+
+            fb_send_text(psid, reply, access_token)
+
+            if btn_hits:
+                buttons = []
+                for h in btn_hits[:2]:
+                    if h.get("url"):
+                        buttons.append({
+                            "type": "web_url",
+                            "url": h["url"],
+                            "title": (h.get("title") or t(lang, "btn_view"))[:20]
+                        })
+                if buttons:
+                    fb_send_buttons(psid, t(lang, "quick_view"), buttons, access_token)
+
 
     return "ok", 200
 
