@@ -18,6 +18,8 @@ FETCH_METAFIELDS = os.getenv("FETCH_METAFIELDS", "false").lower() == "true"
 EMBED_MODEL      = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # khớp app.py
 EMBED_BATCH      = int(os.getenv("EMBED_BATCH", "128"))
 API_VER          = os.getenv("SHOPIFY_API_VERSION", "2023-10")
+# locales cần kéo bản dịch (ví dụ: zh, zh-TW, zh-CN, th, id…)
+LOCALES          = [s.strip() for s in os.getenv("LOCALES", "zh,zh-TW,zh-CN").split(",") if s.strip()]
 
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
@@ -128,10 +130,37 @@ def fetch_product_metafields(pid: int):
             parts.append(f"{ns}.{key}: {val}")
     return " | ".join(parts)
 
+def fetch_product_translations(pid: int, locales):
+    """
+    Dùng Translations API để lấy title/body_html theo từng locale.
+    Trả về: {locale: {"title": "...", "body_html": "..."}, ...}
+    """
+    out = {}
+    if not locales:
+        return out
+    for lc in locales:
+        try:
+            url = f"https://{STORE}/admin/api/{API_VER}/translations.json"
+            params = {"locale": lc, "resource_type": "Product", "resource_id": pid}
+            r = _get(url, params=params)
+            arr = r.json().get("translations", []) or []
+            rec = {}
+            for tr in arr:
+                key = tr.get("key")
+                val = tr.get("value")
+                if key in ("title", "body_html") and val:
+                    rec[key] = val
+            if rec:
+                out[lc] = rec
+        except Exception as e:
+            print(f"⚠️ translation fetch error pid={pid} lc={lc}: {repr(e)}")
+    return out
+
 # ---------- build docs ----------
 def build_docs(products):
     docs = []
     for p in products:
+        pid     = p.get("id")
         title   = (p.get("title") or "").strip()
         handle  = (p.get("handle") or "").strip()
         url     = shop_product_url(handle)
@@ -141,6 +170,14 @@ def build_docs(products):
         vendor  = p.get("vendor", "") or ""
         status  = (p.get("status") or "active").lower()  # 'active'|'draft'|'archived'
 
+        # Kéo bản dịch đa ngôn ngữ (nếu có)
+        i18n = fetch_product_translations(pid, LOCALES)
+        alt_titles = []
+        alt_bodies = []
+        for lc, rec in i18n.items():
+            if rec.get("title"):     alt_titles.append(f"[{lc}] {rec['title']}")
+            if rec.get("body_html"): alt_bodies.append(strip_html(rec["body_html"]))
+
         options_map = {(opt.get("name") or "").strip(): opt.get("values", [])
                        for opt in (p.get("options") or [])}
 
@@ -148,7 +185,7 @@ def build_docs(products):
         if p.get("images"):
             first_image = p["images"][0].get("src") or ""
 
-        specs_txt = fetch_product_metafields(p.get("id"))
+        specs_txt = fetch_product_metafields(pid)
 
         variants = p.get("variants") or [{}]
         first_price_fallback = None
@@ -179,6 +216,7 @@ def build_docs(products):
             optvals = [o for o in optvals if o]
             variant_caption = " / ".join(optvals) if optvals else (v.get("title") or "").strip() or "Default"
 
+            # Ghép alt title/body (đa ngôn ngữ) vào chunk để FAISS học token CJK/TH/ID
             base = (
                 f"Product: {title}\n"
                 f"Type: {ptype}\nVendor: {vendor}\nTags: {tags}\n"
@@ -191,18 +229,20 @@ def build_docs(products):
                 f"Status: {status}\n"
                 f"{('Specs: ' + specs_txt) if specs_txt else ''}\n"
                 f"Body: {body}\n"
+                f"AltTitle: {' | '.join(alt_titles)}\n"
+                f"AltBody: {' | '.join(alt_bodies)}\n"
                 f"URL: {url}"
             )
 
             for chunk in text_to_chunks(base, maxlen=800):
                 docs.append({
                     "type": "product",
-                    "id": p.get("id"),
+                    "id": pid,
                     "title": title or "",
                     "handle": handle or "",
                     "tags": tags or "",
                     "url": url or "",
-                    "price": (price or first_price_fallback or ""),    # app.py hiển thị chuỗi + “ đ”
+                    "price": (price or first_price_fallback or ""),    # app.py sẽ tự định dạng
                     "product_type": ptype or "",
                     "vendor": vendor or "",
                     "status": status or "active",                      # 'active'|'draft'|'archived'
@@ -211,7 +251,9 @@ def build_docs(products):
                     "image": first_image or "",
                     "inventory_quantity": qty if (qty is None or isinstance(qty, int)) else None,
                     "available": bool(available),
-                    "text": chunk or ""
+                    "text": chunk or "",
+                    # lưu i18n để debug (có thể bỏ nếu muốn nhẹ)
+                    "title_i18n": i18n
                 })
     return docs
 
