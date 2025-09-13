@@ -1376,8 +1376,7 @@ def webhook():
         return (challenge, 200) if token == VERIFY_TOKEN else ("Invalid verification token", 403)
 
     # --- Events (POST)
-    ok_sig = _verify_fb_sig(request)
-    if not ok_sig:
+    if not _verify_fb_sig(request):
         ua = request.headers.get("User-Agent", "?")
         print(f"[Webhook][POST] ❌ Invalid signature (UA={ua})")
         return "Invalid signature", 403
@@ -1385,63 +1384,68 @@ def webhook():
     payload = request.json or {}
     print("[Webhook][POST] 🔔 incoming:", json.dumps(payload)[:500])
 
-    # mỗi entry là 1 trang (page/IG account)
     for entry in payload.get("entry", []):
         owner_id = str(entry.get("id"))
-        access_token = TOKEN_MAP.get(owner_id)
-        if not access_token:
+        page_token = TOKEN_MAP.get(owner_id)
+        if not page_token:
             print(f"[Webhook] ⚠️ No token mapped for owner_id={owner_id}. TOKEN_MAP size={len(TOKEN_MAP)}")
             continue
 
         for event in entry.get("messaging", []):
             try:
-                # bỏ echo của chính page
+                # 1) Bỏ qua các event không phải user nhắn tin
                 if event.get("message", {}).get("is_echo"):
+                    continue
+                if "delivery" in event or "read" in event or "reaction" in event:
+                    continue
+                if not (event.get("message") or event.get("postback")):
                     continue
 
                 psid = event.get("sender", {}).get("id")
                 if not psid:
                     continue
 
-                # lấy text từ nhiều nguồn
-                text = None
-                msg = event.get("message", {})
-                pb  = event.get("postback", {})
+                msg = event.get("message", {}) or {}
+                pb  = event.get("postback", {}) or {}
 
+                # 2) Lấy text hợp lệ
+                text = None
                 if "text" in msg:
                     text = msg["text"]
-                elif pb.get("payload"):
-                    text = pb["payload"]        # ✅ quan trọng
                 elif msg.get("quick_reply", {}).get("payload"):
                     text = msg["quick_reply"]["payload"]
+                elif pb.get("payload"):
+                    text = pb["payload"]
                 elif pb.get("title"):
                     text = pb["title"]
 
-                # nếu không có text → phản hồi nhẹ
+                # 3) Nếu chỉ là attachments → nhắn 1 câu rồi thôi
                 if not text:
-                    fb_send_text(psid, "Mình đã nhận được tin nhắn (ảnh/file). Bạn mô tả giúp mình nhé 😊", access_token)
+                    if msg.get("attachments"):
+                        fb_send_text(psid, "Mình đã nhận ảnh/file bạn gửi. Mô tả thêm để mình tư vấn nhé 😊", page_token)
                     continue
 
-                # chống duplicate theo mid
-                mid = msg.get("mid") or pb.get("mid") or str(event.get("timestamp"))
-                sess = _get_sess(psid)
-                if mid and sess.get("last_mid") == mid:
-                    continue
-                sess["last_mid"] = mid
+                # 4) Chống trùng theo MID (không dùng timestamp)
+                mid = msg.get("mid") or pb.get("mid")
+                if mid:
+                    sess = _get_sess(psid)
+                    if sess.get("last_mid") == mid:
+                        continue
+                    sess["last_mid"] = mid
 
-                fb_mark_seen(psid, access_token)
-                fb_typing_on(psid, access_token)
+                fb_mark_seen(psid, page_token)
+                fb_typing_on(psid, page_token)
 
                 _remember(psid, "user", text)
                 reply, btn_hits = answer_with_rag(psid, text)
                 lang = detect_lang(text)
                 _remember(psid, "assistant", reply)
 
-                fb_send_text(psid, reply, access_token)
+                fb_send_text(psid, reply, page_token)
 
                 if btn_hits:
                     buttons = []
-                    for h in btn_hits[:3]:  # tối đa 3 nút
+                    for h in btn_hits[:3]:
                         if h.get("url"):
                             buttons.append({
                                 "type": "web_url",
@@ -1449,14 +1453,15 @@ def webhook():
                                 "title": (h.get("title") or t(lang, "btn_view"))[:20]
                             })
                     if buttons:
-                        fb_send_buttons(psid, t(lang, "quick_view"), buttons, access_token)
+                        fb_send_buttons(psid, t(lang, "quick_view"), buttons, page_token)
 
             except Exception as e:
                 print("[Webhook][POST] ⚠️ handle event error:", repr(e))
                 continue
 
-    # ✅ Luôn trả về 200 sau khi xử lý xong tất cả entry/events
+    # Luôn 200 sau khi xử lý xong
     return "ok", 200
+
 
 
 # ========= API =========
