@@ -1,3 +1,4 @@
+ 
 # -*- coding: utf-8 -*-
 import unicodedata
 import os, json, time, re, requests, numpy as np, faiss, threading, random
@@ -56,16 +57,6 @@ def _char_ngrams(s: str, n=2):
 
 # --- Cross-language helpers ---
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
-# --- ZH compat: chuyển một số ký tự Phồn thể -> Giản thể để so khớp
-_ZH_T2S = str.maketrans({
-    "錶":"表","鐘":"钟","帶":"带","鏈":"链","鋼":"钢","膠":"胶","殼":"壳","護":"护","貼":"贴",
-    "滿":"满","鏡":"镜","頭":"头","機":"机","臺":"台","檔":"档","質":"质","適":"适","極":"极",
-    "鬆":"松","顯":"显","內":"内","顆":"颗","營":"营","現":"现","網":"网","聯":"联","門":"门",
-    "開":"开","廣":"广","電":"电","舊":"旧","雜":"杂","據":"据","錄":"录","幀":"帧",
-})
-
-def _zh_compat(s: str) -> str:
-    return (s or "").translate(_ZH_T2S)
 
 def _any_cjk(s: str) -> bool:
     return bool(CJK_RE.search(s or ""))
@@ -99,71 +90,52 @@ TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "2"))
 TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.25"))
 TITLE_MAX_CHECK = int(os.getenv("TITLE_MAX_CHECK", "5"))
 
-def _has_title_overlap(q: str, hits: list, min_words: Optional[int] = None, min_cover: float = 0.6) -> bool:
+def _has_title_overlap(
+    q: str,
+    hits: list,
+    min_words: Optional[int] = None,   # nếu dùng Python 3.10+ có thể dùng: int | None
+    min_cover: float = 0.6
+) -> bool:
+    """
+    Kiểm tra mức trùng khớp giữa câu hỏi và title các hit.
+    - Ngôn ngữ có khoảng trắng: yêu cầu số từ trùng tối thiểu (TITLE_MIN_WORDS) hoặc tỉ lệ phủ >= min_cover.
+    - CJK/không có khoảng trắng: dùng bigram ký tự với ngưỡng TITLE_CJK_MIN_COVER.
+    """
     if not q or not hits:
         return False
+
     if min_words is None:
         min_words = TITLE_MIN_WORDS
 
-    lang = detect_lang(q)
     qn1, qn2 = _norm_both(q)
     qtok = [w for w in qn1.split() if len(w) > 1]
 
-    # dùng đồng nghĩa/biến thể (có cả ZH & TW→CN)
-    syn_tokens = _query_tokens(q, lang=lang)
-    syn_tokens |= {_zh_compat(t) for t in syn_tokens}
-
-    # 0) Nếu thấy bất kỳ token đồng nghĩa nào xuất hiện trong tiêu đề → pass
-    TITLE_ALLOW_SYNONYM_PASS = os.getenv("TITLE_ALLOW_SYNONYM_PASS", "false").lower() == "true"
-    if TITLE_ALLOW_SYNONYM_PASS:
+    # CJK/không có khoảng trắng → so trùng bigram ký tự
+    if not qtok or re.search(r"[\u4e00-\u9fff]", q):
+        qgrams = _char_ngrams(qn1, 2) | _char_ngrams(qn2, 2)
+        if not qgrams:
+            return False
         for d in hits[:TITLE_MAX_CHECK]:
             t1, t2 = _norm_both(d.get("title", ""))
-            t1c, t2c = _zh_compat(t1), _zh_compat(t2)
-            h1_ns, h2_ns  = t1.replace(" ",""), t2.replace(" ","")
-            h1c_ns, h2c_ns = t1c.replace(" ",""), t2c.replace(" ","")
-            if any((t in t1) or (t in t2) or (t in t1c) or (t in t2c) or
-                (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns) or
-                (t.replace(" ","") in h1c_ns) or (t.replace(" ","") in h2c_ns)
-                for t in syn_tokens):
+            tgrams = _char_ngrams(t1, 2) | _char_ngrams(t2, 2)
+            cover = len(qgrams & tgrams) / max(1, len(qgrams))
+            if cover >= TITLE_CJK_MIN_COVER:
                 return True
+        return False
 
-    # 1) So theo từ nếu là ngôn ngữ có khoảng trắng
+    # Ngôn ngữ có khoảng trắng → so theo từ
     for d in hits[:TITLE_MAX_CHECK]:
         t1, t2 = _norm_both(d.get("title", ""))
         matched = sum(1 for w in qtok if (w in t1) or (w in t2))
-        if qtok:
-            cond_min_words = (len(qtok) >= min_words and matched >= min_words)
-            cond_cover = (matched / max(1, len(qtok))) >= min_cover
-            if cond_min_words or cond_cover:
-                return True
-
-    # 2) So theo bigram ký tự nếu truy vấn là CJK, HOẶC top hit có CJK, HOẶC câu rất ngắn
-    if _any_cjk(q) or _cjk_in_hits(hits) or len(qtok) <= 1:
-        qgrams = set()
-        for s in (qn1, qn2, _zh_compat(qn1), _zh_compat(qn2)):
-            qgrams |= _char_ngrams(s, 2)
-        # thêm bigram từ các đồng nghĩa CJK
-        for s in [t for t in syn_tokens if _any_cjk(t)]:
-            qgrams |= _char_ngrams(s, 2) | _char_ngrams(_zh_compat(s), 2)
-
-        if qgrams:
-            for d in hits[:TITLE_MAX_CHECK]:
-                t1, t2 = _norm_both(d.get("title", ""))
-                t1c, t2c = _zh_compat(t1), _zh_compat(t2)
-                tgrams = (_char_ngrams(t1,2) | _char_ngrams(t2,2) |
-                          _char_ngrams(t1c,2) | _char_ngrams(t2c,2))
-                cover = len(qgrams & tgrams) / max(1, len(qgrams))
-                th = TITLE_CJK_MIN_COVER
-                if len(qgrams) <= 3:
-                    th = max(0.18, th - 0.08)
-                if cover >= th:
-                    return True
-
+        cond_min_words = (len(qtok) >= min_words and matched >= min_words)
+        cond_cover = (matched / max(1, len(qtok))) >= min_cover
+        if cond_min_words or cond_cover:
+            return True
     return False
 
-
-# (Alias tương thích)
+# (tuỳ chọn) Alias để tương thích nếu trước đây gọi tên hàm là "_"
 _ = _has_title_overlap
+
 # ========= BOOTSTRAP =========
 
 APP_SECRET = os.getenv("FB_APP_SECRET", "")
@@ -248,13 +220,8 @@ REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "true").lower() == "true"
 EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 
 # Lọc & ngưỡng điểm
-# Lọc & ngưỡng điểm
-SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.26"))
+SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.28"))
 STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
-
-# Kích hoạt fallback khi FAISS không có hit hoặc điểm quá thấp
-KEYWORD_FALLBACK_TH = float(os.getenv("KEYWORD_FALLBACK_TH", "0.20"))
-
 
 print("=== BOOT ===")
 print("VECTOR_DIR:", os.path.abspath(VECTOR_DIR))
@@ -279,15 +246,15 @@ SESS_MAX = int(os.getenv("SESS_MAX", "2000"))
 
 def _purge_sessions():
     now = time.time()
-    with SESS_LOCK:  # <— thêm lock
-        expired = [k for k,v in SESS.items() if now - v.get("ts",0) > SESSION_TTL]
-        for k in expired:
+    # xoá hết session hết hạn
+    expired = [k for k,v in SESS.items() if now - v.get("ts",0) > SESSION_TTL]
+    for k in expired:
+        SESS.pop(k, None)
+    # nếu vẫn vượt quá SESS_MAX → LRU trim
+    if len(SESS) > SESS_MAX:
+        extra = len(SESS) - SESS_MAX
+        for k,_ in sorted(SESS.items(), key=lambda kv: kv[1].get("ts",0))[:extra]:
             SESS.pop(k, None)
-        if len(SESS) > SESS_MAX:
-            extra = len(SESS) - SESS_MAX
-            for k,_ in sorted(SESS.items(), key=lambda kv: kv[1].get("ts",0))[:extra]:
-                SESS.pop(k, None)
-
 
 def _get_sess(user_id):
     now = time.time()
@@ -312,25 +279,15 @@ def _remember(user_id, role, text):
 
 # ========= OPENAI WRAPPER =========
 def _to_chat_messages(messages):
-    """Chuyển format responses -> chat.completions; chịu được cả content là string."""
+    """Chuyển format responses -> chat.completions để fallback."""
     chat_msgs = []
-    ALLOWED = {"input_text", "output_text", "text"}
+    ALLOWED = {"input_text", "output_text", "text"}  # <-- thêm output_text
     for m in messages:
         role = m.get("role", "user")
-        parts = m.get("content", "")
-        if isinstance(parts, str):
-            text = parts
-        elif isinstance(parts, list):
-            text = "\n".join(
-                p.get("text", "")
-                for p in parts
-                if isinstance(p, dict) and p.get("type") in ALLOWED
-            ).strip()
-        else:
-            text = str(parts) or ""
+        parts = m.get("content", [])
+        text = "\n".join([p.get("text","") for p in parts if p.get("type") in ALLOWED]).strip()
         chat_msgs.append({"role": role, "content": text})
     return chat_msgs
-
 
 
 def call_openai(messages, temperature=0.7):
@@ -524,23 +481,19 @@ def _safe_read_index(prefix):
 IDX_PROD, META_PROD = _safe_read_index("products")
 IDX_POL,  META_POL  = _safe_read_index("policies")
 
-VEC_LOCK = threading.RLock()
-# ...
 def _reload_vectors():
     global IDX_PROD, META_PROD, IDX_POL, META_POL
     try:
-        idxp, metap = _safe_read_index("products")
-        idxk, metak = _safe_read_index("policies")
-        ok = (idxp is not None or idxk is not None)
-        with VEC_LOCK:
-            IDX_PROD, META_PROD = idxp, metap
-            IDX_POL,  META_POL  = idxk, metak
-        print("🔄 Reload vectors:", ok, "| prod_chunks=", len(metap or []), "| policy_chunks=", len(metak or []))
+        IDX_PROD, META_PROD = _safe_read_index("products")
+        IDX_POL,  META_POL  = _safe_read_index("policies")
+        ok = (IDX_PROD is not None or IDX_POL is not None)
+        print("🔄 Reload vectors:", ok,
+              "| prod_chunks=", (len(META_PROD) if META_PROD else 0),
+              "| policy_chunks=", (len(META_POL) if META_POL else 0))
         return ok
     except Exception as e:
         print("❌ reload vectors:", repr(e))
         return False
-
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
@@ -564,181 +517,15 @@ def _embed_query(q: str) -> Optional[np.ndarray]:
         print("⚠️ _embed_query error:", repr(e))
         return None
 
-def _keyword_fallback(query: str, topk: int = None):
-    """
-    Quét META_PROD bằng token/đồng nghĩa (kèm TW→CN) nhưng lọc NGHIÊM:
-    - Ưu tiên match ở title.
-    - Với CJK: yêu cầu cover theo bigram đạt ngưỡng.
-    - Trả về tối đa FALLBACK_MAX_ITEMS.
-    """
-    if not META_PROD:
-        return [], []
-
-    if topk is None:
-        topk = int(os.getenv("FALLBACK_MAX_ITEMS", "12"))
-
-    lang = detect_lang(query)
-    is_cjk = _any_cjk(query) or (lang == "zh")
-
-    # token cơ sở (có dấu/không dấu) + TW→CN
-    toks = _query_tokens(query, lang=lang)
-    toks |= {_zh_compat(t) for t in toks}
-    # Ưu tiên token dài (>=3) để tránh "vơ" rộng
-    toks = {t for t in toks if len(t.replace(" ", "")) >= 3}
-
-    qn1, qn2 = _norm_both(query)
-    qn1c, qn2c = _zh_compat(qn1), _zh_compat(qn2)
-
-    # Bigram cho CJK để tính cover
-    qgrams = set()
-    if is_cjk:
-        for s in (qn1, qn2, qn1c, qn2c):
-            qgrams |= _char_ngrams(s, 2)
-
-    FALLBACK_REQUIRE_TITLE_HIT = os.getenv("FALLBACK_REQUIRE_TITLE_HIT", "true").lower() == "true"
-    FALLBACK_MIN_WORDS = int(os.getenv("FALLBACK_MIN_WORDS", "2"))
-    FALLBACK_CJK_MIN_COVER = float(os.getenv("FALLBACK_CJK_MIN_COVER", "0.30"))
-
-    scored = []  # (score, idx)
-    for i, d in enumerate(META_PROD):
-        title = d.get("title", "")
-        tags  = d.get("tags", "")
-        ptype = d.get("product_type", "")
-        variant = d.get("variant", "")
-
-        t1, t2 = _norm_both(title)
-        t1c, t2c = _zh_compat(t1), _zh_compat(t2)
-        h_title_variants = (t1, t2, t1c, t2c)
-
-        hay_raw = " ".join([title, tags, ptype, variant])
-        h1, h2 = _norm_both(hay_raw)
-        h1c, h2c = _zh_compat(h1), _zh_compat(h2)
-        h1_ns, h2_ns = h1.replace(" ", ""), h2.replace(" ", "")
-        h1c_ns, h2c_ns = h1c.replace(" ", ""), h2c.replace(" ", "")
-
-        # ----- Scoring (ưu tiên trúng TITLE) -----
-        s = 0.0
-
-        # 1) Exact/phrase chứa nguyên câu hỏi (đã chuẩn hoá)
-        for ht in h_title_variants:
-            if qn1 and qn1 in ht: s += 20
-            if qn2 and qn2 in ht: s += 18
-            if qn1c and qn1c in ht: s += 22
-            if qn2c and qn2c in ht: s += 20
-
-        # 2) Đếm token match (title nặng hơn)
-        title_tok = 0
-        total_tok = 0
-        for t in toks:
-            tns = t.replace(" ", "")
-            in_title = any((t in ht) or (tns in ht.replace(" ", "")) for ht in h_title_variants)
-            if in_title:
-                s += 4.0
-                title_tok += 1
-            # match ở tags/type/variant điểm nhẹ hơn
-            if (t in h1) or (t in h2) or (t in h1c) or (t in h2c) or \
-               (tns in h1_ns) or (tns in h2_ns) or (tns in h1c_ns) or (tns in h2c_ns):
-                s += 1.0
-                total_tok += 1
-
-        # 3) CJK: cover theo bigram ở TITLE
-        if is_cjk and qgrams:
-            tgrams = set()
-            for ht in h_title_variants:
-                tgrams |= _char_ngrams(ht, 2)
-            cover = len(qgrams & tgrams) / max(1, len(qgrams))
-            s += 10.0 * cover  # cộng nhẹ để xếp hạng
-
-            # Gate cho CJK: bắt buộc cover đạt ngưỡng
-            if cover < FALLBACK_CJK_MIN_COVER:
-                continue
-
-        # Gate bắt buộc: phải có match trong TITLE nếu bật
-        if FALLBACK_REQUIRE_TITLE_HIT and title_tok == 0:
-            continue
-
-        # Gate ngôn ngữ có khoảng trắng: cần tối thiểu N token
-        if not is_cjk and (title_tok < FALLBACK_MIN_WORDS and total_tok < FALLBACK_MIN_WORDS + 1):
-            continue
-
-        if s > 0:
-            scored.append((s, i))
-
-    if not scored:
-        return [], []
-
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    idxs = [i for s, i in scored[:topk]]
-
-    # Khử trùng lặp theo (url, title)
-    hits, seen = [], set()
-    for i in idxs:
-        d = META_PROD[i]
-        key = (d.get("url"), (d.get("title") or "").lower().strip())
-        if key in seen:
-            continue
-        seen.add(key)
-        hits.append(d)
-
-    # Chặn lần cuối: yêu cầu trùng title ở mức hợp lý
-    # (nhẹ hơn chút so với filter phía ngoài để không quá khắt khe)
-    filt = []
-    for d in hits:
-        if _has_title_overlap(query, [d], min_words=FALLBACK_MIN_WORDS, min_cover=(FALLBACK_CJK_MIN_COVER if is_cjk else 0.6)):
-            filt.append(d)
-    if filt:
-        hits = filt
-
-    return hits, [1.0] * len(hits)
-# --- Exact/substring match theo tiêu đề (ưu tiên tuyệt đối) ---
-def _exactish_title_hits(query: str, limit: int = 8):
-    if not META_PROD:
-        return []
-    qn1, qn2 = _norm_both(query)
-    if not (qn1 or qn2):
-        return []
-    qn1c, qn2c = _zh_compat(qn1), _zh_compat(qn2)
-    qn1_ns, qn2_ns = qn1.replace(" ", ""), qn2.replace(" ", "")
-    qn1c_ns, qn2c_ns = qn1c.replace(" ", ""), qn2c.replace(" ", "")
-
-    hits = []
-    for d in META_PROD:
-        t1, t2 = _norm_both(d.get("title", ""))
-        t1c, t2c = _zh_compat(t1), _zh_compat(t2)
-        t1_ns, t2_ns = t1.replace(" ", ""), t2.replace(" ", "")
-        t1c_ns, t2c_ns = t1c.replace(" ", ""), t2c.replace(" ", "")
-
-        # exact hoặc substring đủ dài (≥ 6 kí tự sau normalize)
-        cond = (
-            (qn1 and (qn1 == t1 or (len(qn1) >= 6 and qn1 in t1))) or
-            (qn2 and (qn2 == t2 or (len(qn2) >= 6 and qn2 in t2))) or
-            (qn1c and (qn1c == t1c or (len(qn1c) >= 6 and qn1c in t1c))) or
-            (qn2c and (qn2c == t2c or (len(qn2c) >= 6 and qn2c in t2c))) or
-            (qn1_ns and qn1_ns in t1_ns) or
-            (qn2_ns and qn2_ns in t2_ns) or
-            (qn1c_ns and qn1c_ns in t1c_ns) or
-            (qn2c_ns and qn2c_ns in t2c_ns)
-        )
-        if cond:
-            hits.append(d)
-            if len(hits) >= limit:
-                break
-    return hits
 
 
 def search_products_with_scores(query, topk=8):
-    # 0) ƯU TIÊN exact/substring theo TITLE
-    fast = _exactish_title_hits(query, limit=topk)
-    if fast:
-        print(f"🎯 exact-title hits: {len(fast)}")
-        return fast, [1.0] * len(fast)
-
-    # 1) FAISS
     if IDX_PROD is None:
-        return _keyword_fallback(query, topk)
+        return [], []
+
     v = _embed_query(query)
-    if v is None:
-        return _keyword_fallback(query, topk)
+    if v is None:  # >>> thêm dòng an toàn
+        return [], []
 
     try:
         D, I = IDX_PROD.search(v, topk)
@@ -752,28 +539,11 @@ def search_products_with_scores(query, topk=8):
                 seen.add(key)
                 hits.append(d)
                 scores.append(float(score))
-
-        best = max(scores or [0.0])
-        print(f"📚 product hits: {len(hits)} | best={best:.3f}")
-
-        # chỉ fallback nếu:
-        # - Không có hit, hoặc
-        # - best < KEYWORD_FALLBACK_TH và câu hỏi là CJK (hoặc detect 'zh') nếu KEYWORD_FALLBACK_ONLY_CJK=true
-        only_cjk = os.getenv("KEYWORD_FALLBACK_ONLY_CJK", "true").lower() == "true"
-        is_cjk_q = _any_cjk(query) or (detect_lang(query) == "zh")
-
-        need_kw = (not hits) or (best < KEYWORD_FALLBACK_TH and (is_cjk_q if only_cjk else True))
-        if need_kw:
-            print("↪️ FAISS miss/low-score → keyword fallback")
-            return _keyword_fallback(query, topk)
-
+        print(f"📚 product hits: {len(hits)}")
         return hits, scores
-
     except Exception as e:
         print("⚠️ search_products_with_scores:", repr(e))
-        return _keyword_fallback(query, topk)
-
-
+        return [], []
 def retrieve_context(question, topk=6):
     if IDX_PROD is None and IDX_POL is None:
         return ""
@@ -1152,7 +922,18 @@ def _stock_line(d: dict) -> str:
 def _shorten(txt: str, n=280) -> str:
     t = (txt or "").strip()
     return (t[:n].rstrip() + "…") if len(t) > n else t
-
+def _fmt_price(p, currency="₫"):
+    if p is None:
+        return None
+    try:
+        # nếu p là string: chỉ giữ chữ số
+        s = re.sub(r"\D", "", str(p))
+        if not s:
+            return None
+        val = int(float(s))
+        return f"{val:,.0f}".replace(",", ".") + (f" {currency}" if currency else "")
+    except Exception:
+        return None
 
 def _extract_price_number(txt: str):
     """Bắt 199k / 199.000đ / 1,299,000 VND… → số (float)."""
@@ -1174,38 +955,15 @@ def _extract_price_number(txt: str):
 
 
 def _price_value(d: dict):
-    for k in ("price", "min_price", "max_price"):
+    for k in ("price","min_price","max_price"):
         v = d.get(k)
-        if v is None:
-            continue
-        # Nếu đã là số thì trả thẳng
-        if isinstance(v, (int, float)):
-            return float(v)
-        # Nếu là chuỗi: hỗ trợ 1.299.000đ, 1,299,000 VND, 199k...
-        s = str(v).lower()
-        m = re.search(r"(\d[\d\.,\s]*)(k)?", s)
-        if m:
-            num = m.group(1).replace(".", "").replace(",", "").replace(" ", "")
+        if v is not None:
             try:
-                val = float(num)
-                if m.group(2) == "k":
-                    val *= 1000
-                return val
-            except:
+                digits = re.sub(r"\D", "", str(v))
+                return float(digits) if digits else None
+            except Exception:
                 pass
-    # fallback: moi từ text mô tả
-    return _extract_price_number(d.get("text", ""))
-
-
-def _fmt_price(p, currency="₫"):
-    if p is None:
-        return None
-    try:
-        val = int(round(float(p)))  # p đã là số sạch từ _price_value
-        return f"{val:,.0f}".replace(",", ".") + (f" {currency}" if currency else "")
-    except Exception:
-        return None
-
+    return _extract_price_number(d.get("text",""))
 
 
 def _category_key_from_doc(d: dict):
@@ -1379,106 +1137,82 @@ add_syn("台灣", ["臺灣","台湾","taiwan","tw"])
 add_syn("臺灣", ["台灣","台湾","taiwan","tw"])
 add_syn("澳洲", ["australia","úc","au"])
 add_syn("越南", ["vietnam","việt nam","vn"])
-add_syn("手錶", ["手表","腕錶","腕表"])
-add_syn("錶帶", ["表带","表帶","錶鏈","表鏈","金屬錶帶","金属表带"])
-add_syn("鋼化膜", ["钢化膜","玻璃貼","玻璃贴","保護貼","保护贴","滿版玻璃","满版玻璃","全膠","全胶"])
-add_syn("手機殼", ["手机壳","保護殼","保护壳","手機套","手机套","背蓋","背盖"])
+
 
 # --- Bổ sung đồng nghĩa cho shop (TW/繁體) ---
+
+
+
 def _query_tokens(q: str, lang: str = "vi") -> set:
+    """Sinh token từ câu hỏi: có dấu, không dấu, bigram, cụm phrase và synonyms."""
     n1, n2 = _norm_both(q)
-    w1 = [w for w in re.split(r"\s+", n1) if len(w) > 1]
-    w2 = [w for w in re.split(r"\s+", n2) if len(w) > 1]
+    w1 = [w for w in n1.split() if len(w) > 1]
+    w2 = [w for w in n2.split() if len(w) > 1]
 
-    tokens: set[str] = set(w1) | set(w2)
+    tokens = set(w1) | set(w2)
 
-    # Bigrams theo TỪ (có & không dấu) – chỉ làm 1 lần
+    # bigram cho cả có dấu & không dấu (bắt 'sầu riêng', 'banh sau'...)
     for words in (w1, w2):
         for i in range(len(words) - 1):
-            a, b = words[i], words[i + 1]
-            tokens.add(f"{a} {b}")
-            tokens.add(f"{a}{b}")  # biến thể không space
+            tokens.add((words[i] + " " + words[i+1]).strip())
+            tokens.add((words[i] + words[i+1]).strip())  # biến thể không space
 
-    # n-gram theo KÝ TỰ cho CJK (2 & 3), kèm TW→CN
-    if _any_cjk(q):
-        base  = re.sub(r"\s+", "", _normalize_text(q))
-        basec = _zh_compat(base)
-        for s in (base, basec):
-            L = len(s)
-            if L >= 2:
-                tokens.update(s[i:i+2] for i in range(L - 1))
-            if L >= 3:
-                tokens.update(s[i:i+3] for i in range(L - 2))
-
-    # Cụm phrase đặc thù theo ngôn ngữ
     combo_phrases = {
         "vi": ["đồng hồ","dây đồng hồ","kính cường lực","ốp lưng","áo thun","áo phông","bánh crepe","bánh sầu riêng","trà sữa"],
         "en": ["watch band","screen protector","phone case","t shirt","t-shirt","mille crepe","durian crepe","milk tea","bubble tea","boba tea"],
-        "zh": ["手表","表带","钢化膜","手机壳","T恤","可丽饼","榴莲千层","奶茶","珍珠奶茶","手錶","錶帶","鋼化膜","手機殼","可麗餅","榴槤千層","玻璃貼","保護貼","滿版玻璃"],
+        "zh": ["手表","表带","钢化膜","手机壳","T恤","可丽饼","榴莲千层","奶茶","珍珠奶茶"],
         "th": ["นาฬิกา","สายนาฬิกา","ฟิล์มกระจก","เคสโทรศัพท์","เสื้อยืด","เครป","เครปทุเรียน","ชานมไข่มุก"],
-        "id": ["jam tangan","tali jam","pelindung layar","casing hp","kaos","kue crepe","crepe durian","teh susu","bubble tea","boba"],
+        "id": ["jam tangan","tali jam","pelindung layar","casing hp","kaos","kue crepe","crepe durian","teh susu","bubble tea","boba"]
     }
 
     joined_n1 = " ".join(w1)
     for phrase in combo_phrases.get(lang, []):
         if phrase in joined_n1:
             p1, p2 = _norm_both(phrase)
-            variants = {p1, p2, p1.replace(" ", ""), p2.replace(" ", "")}
-            # nếu là CJK thì thêm bản TW→CN
-            if _any_cjk(phrase):
-                c1, c2 = _zh_compat(p1), _zh_compat(p2)
-                variants |= {c1, c2, c1.replace(" ", ""), c2.replace(" ", "")}
-            tokens.update(variants)
+            tokens.update({p1, p2, p1.replace(" ", ""), p2.replace(" ", "")})
 
-    # Đồng nghĩa: nếu phát hiện 1 key hay 1 synonym trong câu hỏi → add tất cả biến thể
-    n1_noacc, n2_noacc = n1, n2
+    # Ánh xạ synonyms (đặt NGOÀI vòng for phrase)
     for key, syns in VN_SYNONYMS.items():
         key_n1, key_n2 = _norm_both(key)
-        seen = (key_n1 in n1_noacc) or (key_n2 in n2_noacc)
+
+        seen = (key_n1 in n1) or (key_n2 in n2)
         if not seen:
             for s in syns:
                 s1, s2 = _norm_both(s)
-                if s1 in n1_noacc or s2 in n2_noacc:
+                if s1 in n1 or s2 in n2:
                     seen = True
                     break
+
         if seen:
             for s in [key] + list(syns):
                 s1, s2 = _norm_both(s)
-                cand = {s1, s2, s1.replace(" ", ""), s2.replace(" ", "")}
-                if _any_cjk(s):
-                    c1, c2 = _zh_compat(s1), _zh_compat(s2)
-                    cand |= {c1, c2, c1.replace(" ", ""), c2.replace(" ", "")}
-                tokens.update(cand)
+                tokens.update({s1, s2, s1.replace(" ", ""), s2.replace(" ", "")})
 
-    # Loại bỏ rỗng, giữ token dài ≥ 2
-    return {t.strip() for t in tokens if isinstance(t, str) and len(t.strip()) >= 2}
+    return {t for t in tokens if len(t) >= 2}
+
+
 
 def filter_hits_by_query(hits, q, lang="vi"):
+    """Giữ hit nếu có token/cụm từ câu hỏi xuất hiện trong title/tags/type/variant (có & không dấu)."""
     if not hits:
         return []
     qtoks = _query_tokens(q, lang=lang)
-    # thêm biến thể TW->CN cho token
-    qtoks = qtoks | {_zh_compat(t) for t in qtoks}
 
     kept = []
     for d in hits:
-        hay_raw = " ".join([d.get("title",""), d.get("tags",""), d.get("product_type",""), d.get("variant","")])
+        hay_raw = " ".join([
+            d.get("title",""), d.get("tags",""), d.get("product_type",""), d.get("variant","")
+        ])
         h1, h2 = _norm_both(hay_raw)
-        h1c, h2c = _zh_compat(h1), _zh_compat(h2)
-
-        h1_ns, h2_ns   = h1.replace(" ", ""), h2.replace(" ", "")
-        h1c_ns, h2c_ns = h1c.replace(" ", ""), h2c.replace(" ", "")
+        h1_ns, h2_ns = h1.replace(" ", ""), h2.replace(" ", "")
 
         ok = any(
-            (t in h1) or (t in h2) or (t in h1c) or (t in h2c) or
-            (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns) or
-            (t.replace(" ","") in h1c_ns) or (t.replace(" ","") in h2c_ns)
+            (t in h1) or (t in h2) or (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns)
             for t in qtoks
         )
         if ok:
             kept.append(d)
     return kept
-
 
 
 def should_relax_filter(q: str, hits: list) -> bool:
@@ -1564,21 +1298,13 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
     lines = []
     title = main.get("title") or "Sản phẩm"
     lines.append(f"Vâng ạ, **{title}** đang được shop bán với **giá công khai: {main_price_str}**.")
-   # trong compose_price_with_suggestions
     sug = []
     if high:
-        hp_val = _price_value(high)
-        hp = _fmt_price(hp_val, currency) if hp_val is not None else None
-        line = f"• **Cùng dòng – giá cao nhất:** {high.get('title','SP')}"
-        if hp: line += f" — {hp}"
-        sug.append(line)
-
+        hp = _fmt_price(_price_value(high), currency)
+        sug.append(f"• **Cùng dòng – giá cao nhất:** {high.get('title','SP')} — {hp}")
     if low:
-        lp_val = _price_value(low)
-        lp = _fmt_price(lp_val, currency) if lp_val is not None else None
-        line = f"• **Cùng dòng – giá thấp nhất:** {low.get('title','SP')}"
-        if lp: line += f" — {lp}"
-        sug.append(line)
+        lp = _fmt_price(_price_value(low), currency)
+        sug.append(f"• **Cùng dòng – giá thấp nhất:** {low.get('title','SP')} — {lp}")
 
     if sug:
         lines.append("Bạn cũng có thể tham khảo thêm:")
@@ -1623,9 +1349,11 @@ def answer_with_rag(user_id, user_question):
 
     title_ok = _has_title_overlap(user_question, prod_hits)
 
-    # Chỉ chuyển sang product nếu thật sự mạnh (qua score gate) và có hit sau lọc
-    if intent == "other" and filtered_hits and ok_by_score:
+    if intent == "other" and (filtered_hits or title_ok):
         intent = "product"
+
+    if title_ok and not filtered_hits:
+        filtered_hits = prod_hits
 
     print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
 
@@ -1701,8 +1429,7 @@ def webhook():
         return "Invalid signature", 403
 
     payload = request.json or {}
-    print("[Webhook][POST] 🔔 batch entries:", len(payload.get("entry", [])))
-
+    print("[Webhook][POST] 🔔 incoming:", json.dumps(payload)[:500])
 
     for entry in payload.get("entry", []):
         owner_id = str(entry.get("id"))
@@ -1914,5 +1641,4 @@ if __name__ == "__main__":
         _start_vector_watcher()
     port = int(os.getenv("PORT", 3000))
     print(f"🚀 Starting app on 0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
-
+    # app.run(host="0.0.0.0", port=port, debug=False)
