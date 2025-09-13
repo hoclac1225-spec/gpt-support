@@ -1193,26 +1193,49 @@ def _query_tokens(q: str, lang: str = "vi") -> set:
 
 
 def filter_hits_by_query(hits, q, lang="vi"):
-    """Giữ hit nếu có token/cụm từ câu hỏi xuất hiện trong title/tags/type/variant (có & không dấu)."""
+    """Giữ hit nếu có token/cụm từ câu hỏi xuất hiện trong title/tags/type/variant.
+       Với CJK (ZH/JP/KR) dùng bigram ký tự để so trùng ổn định hơn.
+    """
     if not hits:
         return []
-    qtoks = _query_tokens(q, lang=lang)
 
+    # --- Nhánh CJK: so trùng bằng bigram ký tự, dùng ngưỡng phủ thấp ---
+    if _any_cjk(q):
+        q1, q2 = _norm_both(q)
+        qgrams = _char_ngrams(q1, 2) | _char_ngrams(q2, 2)
+        kept = []
+        for d in hits:
+            hay = " ".join([
+                d.get("title",""), d.get("tags",""),
+                d.get("product_type",""), d.get("variant","")
+            ])
+            h1, h2 = _norm_both(hay)
+            hgrams = _char_ngrams(h1, 2) | _char_ngrams(h2, 2)
+            cover = len(qgrams & hgrams) / max(1, len(qgrams))
+            # có thể chỉnh qua env: TITLE_CJK_FILTER_COVER
+            if cover >= float(os.getenv("TITLE_CJK_FILTER_COVER", "0.18")):
+                kept.append(d)
+        return kept
+
+    # --- Ngôn ngữ có khoảng trắng: giữ logic cũ ---
+    qtoks = _query_tokens(q, lang=lang)
     kept = []
     for d in hits:
         hay_raw = " ".join([
-            d.get("title",""), d.get("tags",""), d.get("product_type",""), d.get("variant","")
+            d.get("title",""), d.get("tags",""),
+            d.get("product_type",""), d.get("variant","")
         ])
         h1, h2 = _norm_both(hay_raw)
         h1_ns, h2_ns = h1.replace(" ", ""), h2.replace(" ", "")
-
         ok = any(
-            (t in h1) or (t in h2) or (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns)
+            (t in h1) or (t in h2) or
+            (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns)
             for t in qtoks
         )
         if ok:
             kept.append(d)
     return kept
+
 
 
 def should_relax_filter(q: str, hits: list) -> bool:
@@ -1533,8 +1556,10 @@ def chat_rag():
 @app.route("/api/product_search")
 def api_product_search():
     q = (request.args.get("q") or "").strip()
+    debug = request.args.get("debug") == "1"   # <-- thêm dòng này
     if not q:
         return jsonify({"ok": False, "msg": "missing q"}), 400
+
     lang = detect_lang(q)
     hits, scores = search_products_with_scores(q, topk=8)
     best = max(scores or [0.0])
@@ -1548,10 +1573,23 @@ def api_product_search():
 
     if not kept or (not ok_by_score and not title_ok):
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
-        return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
+        resp = {"ok": True, "reply": t(lang, "oos", url=url), "items": []}
+    else:
+        reply = compose_product_reply(kept, lang=lang)
+        resp = {"ok": True, "reply": reply, "items": kept[:2]}
 
-    reply = compose_product_reply(kept, lang=lang)
-    return jsonify({"ok": True, "reply": reply, "items": kept[:2]})
+    # trả kèm số đo khi bật debug=1
+    if debug:
+        resp["diag"] = {
+            "hits": len(hits),
+            "kept_after_filter": len(kept),
+            "best_score": best,
+            "title_ok": title_ok,
+            "lang": lang,
+            "strict_match": STRICT_MATCH,
+        }
+    return jsonify(resp)
+
 
 
 # ========= IG OAuth callback & policy pages =========
