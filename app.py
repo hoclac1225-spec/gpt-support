@@ -1348,6 +1348,11 @@ def answer_with_rag(user_id, user_question):
         filtered_hits = prod_hits
 
     title_ok = _has_title_overlap(user_question, prod_hits)
+    # --- CỨU CÁNH THEO ĐIỂM ---
+    # nếu filter bị rỗng nhưng điểm đã đạt ngưỡng → giữ nguyên prod_hits
+    if not filtered_hits and ok_by_score:
+        filtered_hits = prod_hits
+
 
     if intent == "other" and (filtered_hits or title_ok):
         intent = "product"
@@ -1545,6 +1550,10 @@ def api_product_search():
 
     ok_by_score = _score_gate(q, hits, best)
     title_ok = _has_title_overlap(q, hits)
+    # --- CỨU CÁNH THEO ĐIỂM ---
+    if not kept and ok_by_score:
+        kept = hits
+
 
     if not kept or (not ok_by_score and not title_ok):
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
