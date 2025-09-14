@@ -155,6 +155,31 @@ def fetch_product_translations(pid: int, locales):
         except Exception as e:
             print(f"⚠️ translation fetch error pid={pid} lc={lc}: {repr(e)}")
     return out
+# --- thêm gần phần fetch_* ---
+TRAN_LOCALES = [s.strip() for s in os.getenv("TRAN_LOCALES", "zh-CN,zh-TW,vi,en,th,id").split(",")]
+
+def fetch_translations(pid: int, locales=TRAN_LOCALES):
+    """Lấy title/body/options/tags đã dịch từ Shopify Translations API."""
+    outs = []
+    for loc in locales:
+        try:
+            u = f"https://{STORE}/admin/api/{API_VER}/translations.json"
+            params = {"locale": loc, "resource_type": "Product", "resource_id": pid}
+            r = _get(u, params=params)
+            arr = r.json().get("translations", []) or []
+            # gom nội dung hữu ích
+            for t in arr:
+                k = (t.get("key") or "").lower()
+                v = (t.get("value") or "").strip()
+                if not v: 
+                    continue
+                if any(x in k for x in ["title","body_html","product_type","tags","option","name","value"]):
+                    outs.append(v)
+        except Exception as e:
+            print("⚠️ translation fetch error pid=", pid, "loc=", loc, repr(e))
+    # lọc rác + rút gọn
+    text = " | ".join(re.sub(r"<[^>]+>"," ", s) for s in outs if s)
+    return re.sub(r"\s+", " ", text).strip()
 
 # ---------- build docs ----------
 def build_docs(products):
@@ -165,7 +190,7 @@ def build_docs(products):
         handle  = (p.get("handle") or "").strip()
         url     = shop_product_url(handle)
         body    = strip_html(p.get("body_html", ""))
-        tags    = p.get("tags", "") or ""
+        tags = " | ".join([p.get("tags","") or "", trans_txt]) if trans_txt else (p.get("tags","") or "")
         ptype   = p.get("product_type", "") or ""
         vendor  = p.get("vendor", "") or ""
         status  = (p.get("status") or "active").lower()  # 'active'|'draft'|'archived'
@@ -186,6 +211,8 @@ def build_docs(products):
             first_image = p["images"][0].get("src") or ""
 
         specs_txt = fetch_product_metafields(pid)
+        # >>> NEW: bản dịch đa ngôn ngữ
+        trans_txt = fetch_translations(p.get("id"))
 
         variants = p.get("variants") or [{}]
         first_price_fallback = None
@@ -218,22 +245,20 @@ def build_docs(products):
 
             # Ghép alt title/body (đa ngôn ngữ) vào chunk để FAISS học token CJK/TH/ID
             base = (
-                f"Product: {title}\n"
-                f"Type: {ptype}\nVendor: {vendor}\nTags: {tags}\n"
-                f"Options: {json.dumps(options_map, ensure_ascii=False)}\n"
-                f"Variant: {variant_caption}\n"
-                f"SKU: {sku or '-'}\n"
-                f"Price: {price or first_price_fallback or '-'}\n"
-                f"Inventory: {qty if qty is not None else '-'}\n"
-                f"Available: {available}\n"
-                f"Status: {status}\n"
-                f"{('Specs: ' + specs_txt) if specs_txt else ''}\n"
-                f"Body: {body}\n"
-                f"AltTitle: {' | '.join(alt_titles)}\n"
-                f"AltBody: {' | '.join(alt_bodies)}\n"
-                f"URL: {url}"
-            )
-
+                    f"Product: {title}\n"
+                    f"Type: {ptype}\nVendor: {vendor}\nTags: {tags}\n"
+                    f"Options: {json.dumps(options_map, ensure_ascii=False)}\n"
+                    f"Variant: {variant_caption}\n"
+                    f"SKU: {sku or '-'}\n"
+                    f"Price: {price or first_price_fallback or '-'}\n"
+                    f"Inventory: {qty if qty is not None else '-'}\n"
+                    f"Available: {available}\n"
+                    f"Status: {status}\n"
+                    f"{('Specs: ' + specs_txt) if specs_txt else ''}\n"
+                    f"Translations: {trans_txt}\n"           # <<< TRỘN DỊCH VÀO NỘI DUNG NHÚNG
+                    f"Body: {body}\n"
+                    f"URL: {url}"
+)
             for chunk in text_to_chunks(base, maxlen=800):
                 docs.append({
                     "type": "product",
