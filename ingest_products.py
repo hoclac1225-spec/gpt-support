@@ -182,37 +182,63 @@ def fetch_translations(pid: int, locales=TRAN_LOCALES):
     return re.sub(r"\s+", " ", text).strip()
 
 # ---------- build docs ----------
+# --- Alias mở rộng: ZH (Phồn -> Giản) + TH + ID + EN ---
+_ZH_T2S = {
+    "千層": "千层",
+    "榴槤": "榴莲",
+    "可麗餅": "可丽饼",
+}
+KW_EXPANSIONS = {
+    # Triggers (có trong title/tags/body) -> các alias nên thêm vào tags
+    "千層": ["千层", "mille crepe", "crepe", "可麗餅", "可丽饼", "เครป", "crepe cake"],
+    "榴槤": ["榴莲", "durian", "ทุเรียน"],
+    "可麗餅": ["可丽饼", "crepe", "mille crepe", "เครป"],
+    "奶茶": ["milk tea", "bubble tea", "boba", "ชานม", "ชานมไข่มุก", "teh susu", "boba tea"],
+    # bạn có thể mở rộng thêm…
+}
+
+def _expand_aliases(text_blob: str) -> list[str]:
+    """Nhìn cụm xuất hiện trong text -> trả về list alias để nhét thêm vào tags."""
+    blob = (text_blob or "").lower()
+    adds = []
+    # map T->S đơn giản
+    for t, s in _ZH_T2S.items():
+        if t in text_blob:
+            adds.append(s)
+    # alias theo trigger
+    for trig, alist in KW_EXPANSIONS.items():
+        if trig in text_blob:
+            adds.extend(alist)
+    # khử trùng lặp, trả dạng ' | ' join được
+    out, seen = [], set()
+    for x in adds:
+        xx = x.strip()
+        if xx and xx not in seen:
+            seen.add(xx); out.append(xx)
+    return out
+
 def build_docs(products):
     docs = []
     for p in products:
-        # luôn có giá trị để tránh UnboundLocalError
-        trans_txt = ""
-        try:
-            # nếu bạn có cơ chế kéo bản dịch riêng thì gán vào trans_txt ở đây
-            # ví dụ:
-            # trans_txt = fetch_translations(p.get("id"))  # (tuỳ bạn có hàm này hay không)
-            pass
-        except Exception as e:
-            print("⚠ translation fetch error pid=%s:" % p.get("id"), repr(e))
-            trans_txt = ""
-
-        title   = (p.get("title")  or "").strip()
+        # ---- fields cấp product ----
+        title   = (p.get("title") or "").strip()
         handle  = (p.get("handle") or "").strip()
         url     = shop_product_url(handle)
         body    = strip_html(p.get("body_html", ""))
-        vendor  = (p.get("vendor") or "").strip()
-        ptype   = (p.get("product_type") or "").strip()
+        tags_base = p.get("tags", "") or ""
+        ptype   = p.get("product_type", "") or ""
+        vendor  = p.get("vendor", "") or ""
         status  = (p.get("status") or "active").lower()
 
-        # gộp tag + bản dịch (nếu có)
-        tags_base = p.get("tags", "") or ""
-        tags = " | ".join([tags_base, trans_txt]) if trans_txt else tags_base
+        created_at   = p.get("created_at")   or ""
+        published_at = p.get("published_at") or ""
+        updated_at   = p.get("updated_at")   or ""
 
-        # map options
+        # options map: {"Color": ["Red","Blue"], ...}
         options_map = {(opt.get("name") or "").strip(): (opt.get("values") or [])
                        for opt in (p.get("options") or [])}
 
-        # ảnh đầu tiên (nếu có)
+        # ảnh đại diện
         first_image = ""
         if p.get("images"):
             first_image = (p["images"][0].get("src") or "").strip()
@@ -220,42 +246,59 @@ def build_docs(products):
         # metafields (nếu bật)
         specs_txt = fetch_product_metafields(p.get("id"))
 
-        # thông tin thời gian (phục vụ “hàng mới” sau này)
-        created_at   = p.get("created_at")   or ""
-        published_at = p.get("published_at") or ""
-        updated_at   = p.get("updated_at")   or ""
+        # ✅ tạo blob để dò trigger & bơm alias đa ngôn ngữ vào tags
+        trigger_blob = " ".join([title, tags_base, body, specs_txt])
+        alias_list = _expand_aliases(trigger_blob)
+        alias_str  = " | ".join(alias_list) if alias_list else ""
+        tags = " | ".join([t for t in [tags_base, alias_str] if t]).strip()
 
+        # các biến dùng chung khi duyệt variants
         variants = p.get("variants") or [{}]
         first_price_fallback = None
 
         for v in variants:
+            # ---- fields cấp variant ----
             sku   = (v.get("sku") or "").strip()
-
-            price = v.get("price")
-            if price is not None:
-                price = str(price).strip()
-            if first_price_fallback is None and price:
-                first_price_fallback = price
-
-            # inventory_quantity -> int | None (an toàn)
+            price = (v.get("price") or "").strip()
             try:
-                qty_raw = v.get("inventory_quantity")
-                qty = int(qty_raw) if qty_raw is not None else None
+                # nếu muốn giữ số để app dễ parse, có thể dùng float
+                # nhưng ở đây ta giữ nguyên str và để app format lại
+                pass
+            except Exception:
+                pass
+
+            qty = v.get("inventory_quantity")
+            try:
+                qty = int(qty) if qty is not None else None
             except Exception:
                 qty = None
 
-            # available: suy diễn từ qty + status
+            # available: ưu tiên flag của variant, sau đó dựa vào tồn kho/status
+            available = bool(v.get("available", True))
             if qty is not None:
-                available = (qty > 0) and (status == "active")
-            else:
-                available = (status == "active")
+                available = available and (qty > 0)
+            if status and status != "active":
+                available = False
 
-            # caption variant
-            optvals = [v.get("option1"), v.get("option2"), v.get("option3")]
-            optvals = [o for o in optvals if o]
-            variant_caption = " / ".join(optvals) if optvals else (v.get("title") or "").strip() or "Default"
+            # dùng price đầu tiên làm fallback cho các chunk/variant khác nếu trống
+            if first_price_fallback is None and price:
+                first_price_fallback = price
 
-            # text gốc cho RAG
+            # caption variant (ví dụ: "Color: Red | Size: M")
+            variant_caption = (v.get("title") or "").strip()
+            if not variant_caption or variant_caption.lower() == "default title":
+                # ghép từ options để rõ ràng hơn
+                pieces = []
+                for k in options_map.keys():
+                    # Shopify lưu value thật trong v.get('option1'|'option2'|'option3')
+                    # map theo thứ tự Option1 -> option1, etc.
+                    idx = len(pieces) + 1
+                    val = (v.get(f"option{idx}") or "").strip()
+                    if val:
+                        pieces.append(f"{k}: {val}")
+                variant_caption = " | ".join(pieces) if pieces else "Default"
+
+            # ---- build base text cho RAG ----
             base = (
                 f"Product: {title}\n"
                 f"Type: {ptype}\nVendor: {vendor}\nTags: {tags}\n"
@@ -271,6 +314,7 @@ def build_docs(products):
                 f"URL: {url}"
             )
 
+            # ---- băm thành chunk & append meta ----
             for chunk in text_to_chunks(base, maxlen=800):
                 docs.append({
                     "type": "product",
@@ -279,22 +323,23 @@ def build_docs(products):
                     "handle": handle or "",
                     "tags": tags or "",
                     "url": url or "",
-                    "price": (price or first_price_fallback or ""),     # chuỗi giá
+                    "price": (price or first_price_fallback or ""),     # giữ dạng str
                     "product_type": ptype or "",
                     "vendor": vendor or "",
-                    "status": status or "active",                       # 'active'|'draft'|'archived'
+                    "status": status or "active",
                     "sku": sku or "",
                     "variant": variant_caption or "Default",
                     "image": first_image or "",
                     "inventory_quantity": qty if (qty is None or isinstance(qty, int)) else None,
                     "available": bool(available),
-                    # time fields để lọc “hàng mới”
                     "created_at": created_at,
                     "published_at": published_at,
                     "updated_at": updated_at,
                     "text": chunk or ""
                 })
+
     return docs
+
 
 def dedup_docs(docs):
     """Loại trùng lặp nội dung để giảm nhiễu index."""
