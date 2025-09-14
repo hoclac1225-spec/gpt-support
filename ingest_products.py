@@ -185,54 +185,66 @@ def fetch_translations(pid: int, locales=TRAN_LOCALES):
 def build_docs(products):
     docs = []
     for p in products:
-        pid     = p.get("id")
-        title   = (p.get("title") or "").strip()
+        # luôn có giá trị để tránh UnboundLocalError
+        trans_txt = ""
+        try:
+            # nếu bạn có cơ chế kéo bản dịch riêng thì gán vào trans_txt ở đây
+            # ví dụ:
+            # trans_txt = fetch_translations(p.get("id"))  # (tuỳ bạn có hàm này hay không)
+            pass
+        except Exception as e:
+            print("⚠ translation fetch error pid=%s:" % p.get("id"), repr(e))
+            trans_txt = ""
+
+        title   = (p.get("title")  or "").strip()
         handle  = (p.get("handle") or "").strip()
         url     = shop_product_url(handle)
         body    = strip_html(p.get("body_html", ""))
-        tags = " | ".join([p.get("tags","") or "", trans_txt]) if trans_txt else (p.get("tags","") or "")
-        ptype   = p.get("product_type", "") or ""
-        vendor  = p.get("vendor", "") or ""
-        status  = (p.get("status") or "active").lower()  # 'active'|'draft'|'archived'
+        vendor  = (p.get("vendor") or "").strip()
+        ptype   = (p.get("product_type") or "").strip()
+        status  = (p.get("status") or "active").lower()
 
-        # Kéo bản dịch đa ngôn ngữ (nếu có)
-        i18n = fetch_product_translations(pid, LOCALES)
-        alt_titles = []
-        alt_bodies = []
-        for lc, rec in i18n.items():
-            if rec.get("title"):     alt_titles.append(f"[{lc}] {rec['title']}")
-            if rec.get("body_html"): alt_bodies.append(strip_html(rec["body_html"]))
+        # gộp tag + bản dịch (nếu có)
+        tags_base = p.get("tags", "") or ""
+        tags = " | ".join([tags_base, trans_txt]) if trans_txt else tags_base
 
-        options_map = {(opt.get("name") or "").strip(): opt.get("values", [])
+        # map options
+        options_map = {(opt.get("name") or "").strip(): (opt.get("values") or [])
                        for opt in (p.get("options") or [])}
 
+        # ảnh đầu tiên (nếu có)
         first_image = ""
         if p.get("images"):
-            first_image = p["images"][0].get("src") or ""
+            first_image = (p["images"][0].get("src") or "").strip()
 
-        specs_txt = fetch_product_metafields(pid)
-        # >>> NEW: bản dịch đa ngôn ngữ
-        trans_txt = fetch_translations(p.get("id"))
+        # metafields (nếu bật)
+        specs_txt = fetch_product_metafields(p.get("id"))
+
+        # thông tin thời gian (phục vụ “hàng mới” sau này)
+        created_at   = p.get("created_at")   or ""
+        published_at = p.get("published_at") or ""
+        updated_at   = p.get("updated_at")   or ""
 
         variants = p.get("variants") or [{}]
         first_price_fallback = None
 
         for v in variants:
             sku   = (v.get("sku") or "").strip()
+
             price = v.get("price")
             if price is not None:
                 price = str(price).strip()
             if first_price_fallback is None and price:
                 first_price_fallback = price
 
-            # inventory_quantity -> int | None
+            # inventory_quantity -> int | None (an toàn)
             try:
                 qty_raw = v.get("inventory_quantity")
                 qty = int(qty_raw) if qty_raw is not None else None
             except Exception:
                 qty = None
 
-            # available: suy diễn
+            # available: suy diễn từ qty + status
             if qty is not None:
                 available = (qty > 0) and (status == "active")
             else:
@@ -243,42 +255,44 @@ def build_docs(products):
             optvals = [o for o in optvals if o]
             variant_caption = " / ".join(optvals) if optvals else (v.get("title") or "").strip() or "Default"
 
-            # Ghép alt title/body (đa ngôn ngữ) vào chunk để FAISS học token CJK/TH/ID
+            # text gốc cho RAG
             base = (
-                    f"Product: {title}\n"
-                    f"Type: {ptype}\nVendor: {vendor}\nTags: {tags}\n"
-                    f"Options: {json.dumps(options_map, ensure_ascii=False)}\n"
-                    f"Variant: {variant_caption}\n"
-                    f"SKU: {sku or '-'}\n"
-                    f"Price: {price or first_price_fallback or '-'}\n"
-                    f"Inventory: {qty if qty is not None else '-'}\n"
-                    f"Available: {available}\n"
-                    f"Status: {status}\n"
-                    f"{('Specs: ' + specs_txt) if specs_txt else ''}\n"
-                    f"Translations: {trans_txt}\n"           # <<< TRỘN DỊCH VÀO NỘI DUNG NHÚNG
-                    f"Body: {body}\n"
-                    f"URL: {url}"
-)
+                f"Product: {title}\n"
+                f"Type: {ptype}\nVendor: {vendor}\nTags: {tags}\n"
+                f"Options: {json.dumps(options_map, ensure_ascii=False)}\n"
+                f"Variant: {variant_caption}\n"
+                f"SKU: {sku or '-'}\n"
+                f"Price: {price or first_price_fallback or '-'}\n"
+                f"Inventory: {qty if qty is not None else '-'}\n"
+                f"Available: {available}\n"
+                f"Status: {status}\n"
+                f"{('Specs: ' + specs_txt) if specs_txt else ''}\n"
+                f"Body: {body}\n"
+                f"URL: {url}"
+            )
+
             for chunk in text_to_chunks(base, maxlen=800):
                 docs.append({
                     "type": "product",
-                    "id": pid,
+                    "id": p.get("id"),
                     "title": title or "",
                     "handle": handle or "",
                     "tags": tags or "",
                     "url": url or "",
-                    "price": (price or first_price_fallback or ""),    # app.py sẽ tự định dạng
+                    "price": (price or first_price_fallback or ""),     # chuỗi giá
                     "product_type": ptype or "",
                     "vendor": vendor or "",
-                    "status": status or "active",                      # 'active'|'draft'|'archived'
+                    "status": status or "active",                       # 'active'|'draft'|'archived'
                     "sku": sku or "",
                     "variant": variant_caption or "Default",
                     "image": first_image or "",
                     "inventory_quantity": qty if (qty is None or isinstance(qty, int)) else None,
                     "available": bool(available),
-                    "text": chunk or "",
-                    # lưu i18n để debug (có thể bỏ nếu muốn nhẹ)
-                    "title_i18n": i18n
+                    # time fields để lọc “hàng mới”
+                    "created_at": created_at,
+                    "published_at": published_at,
+                    "updated_at": updated_at,
+                    "text": chunk or ""
                 })
     return docs
 
