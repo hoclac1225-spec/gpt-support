@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import hmac, hashlib, base64
 from typing import Optional
+from ingest_products import fetch_all_products, build_docs, dedup_docs, save_faiss
+
 
 # --- Flask & CORS ---
 app = Flask(__name__)
@@ -145,25 +147,22 @@ DISABLE_FB_SIG_VERIFY = os.getenv("DISABLE_FB_SIG_VERIFY", "false").lower() == "
 
 
 def _verify_fb_sig(req) -> bool:
-    """
-    Hỗ trợ cả X-Hub-Signature-256 (sha256) và X-Hub-Signature (sha1).
-    """
-    if DISABLE_FB_SIG_VERIFY:
-        return True  # chỉ dùng khi test
+    # Nếu tắt verify hoặc chưa cấu hình APP_SECRET → cho qua (chỉ nên dùng khi test)
+    if DISABLE_FB_SIG_VERIFY or not APP_SECRET:
+        return True
 
     sig256 = req.headers.get("X-Hub-Signature-256", "")
     sig1   = req.headers.get("X-Hub-Signature", "")
-
     raw = req.get_data()
-    if APP_SECRET and sig256.startswith("sha256="):
+
+    if sig256.startswith("sha256="):
         digest = hmac.new(APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
         return hmac.compare_digest("sha256=" + digest, sig256)
-
-    if APP_SECRET and sig1.startswith("sha1="):
+    if sig1.startswith("sha1="):
         digest = hmac.new(APP_SECRET.encode(), raw, hashlib.sha1).hexdigest()
         return hmac.compare_digest("sha1=" + digest, sig1)
-
     return False
+#////////////////////
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 VERIFY_TOKEN     = os.getenv("VERIFY_TOKEN", "aloha_verify_123")
 # ---- Multi-page map ----
@@ -181,8 +180,6 @@ for i in range(1, 11):
 
     igid = os.getenv(f"IG_ACCOUNT_ID_{i}")
     _add_map(igid, ptk) # map IG Account ID -> dùng CHUNG Page token đã liên kết IG
-print("TOKEN_MAP size:", len(TOKEN_MAP))
-
 
 VECTOR_DIR       = os.getenv("VECTOR_DIR", "./vectors")
 # Shopify
@@ -223,13 +220,12 @@ EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.28"))
 STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
 
+# ...
 print("=== BOOT ===")
 print("VECTOR_DIR:", os.path.abspath(VECTOR_DIR))
 print("TOKEN_MAP size:", len(TOKEN_MAP))
 print("OPENAI key set:", bool(OPENAI_API_KEY))
-
-
-
+print("SUPPORTED_LANGS:", SUPPORTED_LANGS)
 
 # OpenAI
 OPENAI_URL   = "https://api.openai.com/v1/responses"
@@ -439,8 +435,12 @@ def fb_send_buttons(user_id, text, buttons, page_token):
 
 
 # === Reload vectors (FAISS) ===
+# === Reload vectors (FAISS) ===
 CANONICAL_DOMAIN = os.getenv("CANONICAL_DOMAIN", SHOP_URL).rstrip("/")
 ALIAS_DOMAINS = [d.strip().rstrip("/") for d in os.getenv("ALIAS_DOMAINS","").split(",") if d.strip()]
+
+print("CANONICAL_DOMAIN:", CANONICAL_DOMAIN, "| ALIAS_DOMAINS:", ALIAS_DOMAINS)  # <-- move here
+
 
 def _canon_url(u: str) -> str:
     if not u: return u
@@ -503,6 +503,26 @@ def admin_reload_vectors():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     ok = _reload_vectors()
     return jsonify({"ok": ok})
+@app.post("/admin/rebuild_vectors_now")
+def admin_rebuild_vectors_now():
+    if ADMIN_TOKEN and request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    try:
+        t0 = time.time()
+        products = fetch_all_products()
+        docs = dedup_docs(build_docs(products))
+
+        os.makedirs(VECTOR_DIR, exist_ok=True)  # <<< thêm dòng này
+
+        save_faiss(
+            docs,
+            os.path.join(VECTOR_DIR, "products.index"),
+            os.path.join(VECTOR_DIR, "products.meta.json"),
+        )
+        return jsonify({"ok": True, "chunks": len(docs), "t": round(time.time() - t0, 1)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 def _embed_query(q: str) -> Optional[np.ndarray]:
@@ -1362,12 +1382,13 @@ def answer_with_rag(user_id, user_question):
 
     print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
 
-        # --- CONTEXT/POLICY ---
+    # --- CONTEXT/POLICY ---   # <— bỏ thụt vào đầu dòng
     context = retrieve_context(user_question, topk=6)
     if intent == "policy" and context:
         ans = compose_contextual_answer(context, user_question, hist, lang=lang)
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
+
 
     # --- ƯU TIÊN HỎI GIÁ ---
     if is_price_question(user_question, lang) and (filtered_hits or title_ok):
@@ -1537,31 +1558,45 @@ def chat_rag():
 
 @app.route("/api/product_search")
 def api_product_search():
-    q = (request.args.get("q") or "").strip()
-    if not q:
-        return jsonify({"ok": False, "msg": "missing q"}), 400
-    lang = detect_lang(q)
-    hits, scores = search_products_with_scores(q, topk=8)
-    best = max(scores or [0.0])
+    try:
+        q = (request.args.get("q") or "").strip()
+        if not q:
+            return jsonify({"ok": False, "msg": "missing q"}), 400
 
-    kept = filter_hits_by_query(hits, q, lang=lang) if STRICT_MATCH else hits
-    if STRICT_MATCH and not kept and should_relax_filter(q, hits):
-        kept = hits
+        lang = detect_lang(q)
+        if IDX_PROD is None:
+            url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
+            return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
 
-    ok_by_score = _score_gate(q, hits, best)
-    title_ok = _has_title_overlap(q, hits)
-    # --- CỨU CÁNH THEO ĐIỂM ---
-    if not kept and ok_by_score:
-        kept = hits
+        hits, scores = search_products_with_scores(q, topk=8)
+        best = max(scores or [0.0])
 
+        kept = filter_hits_by_query(hits, q, lang=lang) if STRICT_MATCH else hits
+        if STRICT_MATCH and not kept and should_relax_filter(q, hits):
+            kept = hits
+        if STRICT_MATCH and not kept and (_any_cjk(q) or _cjk_in_hits(hits)):
+            kept = hits
 
-    if not kept or (not ok_by_score and not title_ok):
-        url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
-        return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
+        ok_by_score = _score_gate(q, hits, best)
+        title_ok    = _has_title_overlap(q, hits)
+        if not kept and ok_by_score:
+            kept = hits
 
-    reply = compose_product_reply(kept, lang=lang)
-    return jsonify({"ok": True, "reply": reply, "items": kept[:2]})
+        if not kept or (not ok_by_score and not title_ok):
+            url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
+            return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
 
+        reply = compose_product_reply(kept, lang=lang)
+        resp = {"ok": True, "reply": reply, "items": kept[:2]}
+        if (request.args.get("debug") or "") == "1":
+            resp["debug"] = {
+                "best": best, "hits": len(hits),
+                "kept_after_filter": len(kept),
+                "title_ok": bool(title_ok), "ok_by_score": bool(ok_by_score),
+            }
+        return jsonify(resp)
+    except Exception as e:
+        return jsonify({"ok": False, "msg": f"error: {e}"}), 500
 
 # ========= IG OAuth callback & policy pages =========
 @app.route("/auth/callback")
