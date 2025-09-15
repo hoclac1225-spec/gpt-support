@@ -10,18 +10,20 @@ from openai import OpenAI
 import hmac, hashlib
 from typing import Optional
 from ingest_products import fetch_all_products, build_docs, dedup_docs, save_faiss
-# --- Flask & CORS ---
-# --- Flask & CORS ---
+from flask import make_response
 # --- Flask & CORS ---
 app = Flask(__name__)
 
 cors_opts = {
     "origins": [
-        r"^https://([a-z0-9-]+\.)?aloha\.id\.vn$",   # *.aloha.id.vn
+        r"^https://([a-z0-9-]+\.)?aloha\.id\.vn$",
         "https://9mn9fa-6p.myshopify.com",
     ],
     "supports_credentials": True,
-    "allow_headers": ["Content-Type", "Authorization", "X-Admin-Token"],
+    "allow_headers": [
+        "Content-Type", "Authorization", "X-Admin-Token",
+        "X-Requested-With", "Accept", "Origin", "Referer"
+    ],
     "methods": ["GET", "POST", "OPTIONS"],
     "max_age": 3600,
 }
@@ -33,7 +35,38 @@ CORS(app, resources={
     r"/admin/.*": cors_opts,
 })
 
+ALLOWED_ORIGIN_RE = re.compile(r"^https://([a-z0-9-]+\.)?aloha\.id\.vn$")
 
+def _allow_origin(origin: str) -> bool:
+    if not origin:
+        return False
+    if origin == "https://9mn9fa-6p.myshopify.com":
+        return True
+    return bool(ALLOWED_ORIGIN_RE.match(origin))
+
+@app.after_request
+def add_cors_headers(resp):
+    origin = request.headers.get("Origin", "")
+    if _allow_origin(origin):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+    "Content-Type, Authorization, X-Admin-Token, X-Requested-With, Accept, Origin, Referer")
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Max-Age"] = "3600"
+    return resp
+
+# Bắt mọi preflight dưới /api/* và /admin/* (phản hồi nhanh 204)
+@app.route("/api/<path:subpath>", methods=["OPTIONS"], provide_automatic_options=False)
+def api_preflight(subpath):
+    resp = make_response("", 204)
+    return resp
+
+@app.route("/admin/<path:subpath>", methods=["OPTIONS"])
+def admin_preflight(subpath):
+    resp = make_response("", 204)
+    return resp
 # Load .env TRƯỚC khi đọc os.getenv
 load_dotenv()
 
@@ -353,21 +386,39 @@ def call_openai(messages, temperature=0.7):
     """
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": OPENAI_MODEL, "input": messages, "temperature": temperature}
+
     try:
         t0 = time.time()
         r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=40)
         dt = (time.time() - t0) * 1000
         print(f"🔁 OpenAI responses status={r.status_code} in {dt:.0f}ms")
+
         if r.status_code == 200:
             data = r.json()
+            reply = None
+
+            # 1) output_text (nếu có)
+            reply = data.get("output_text")
+
+            # 2) parts: data["output"][0]["content"] -> list[{type,text}]
             try:
-                reply = data["output"][0]["content"][0]["text"]
+                parts = (data.get("output") or [{}])[0].get("content") or []
+                if not reply and isinstance(parts, list):
+                    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+                    joined = "\n".join([t for t in texts if t]).strip()
+                    reply = joined or None
             except Exception:
-                reply = data.get("output_text") or "Mình đang ở đây, sẵn sàng hỗ trợ bạn!"
+                pass
+
+            # 3) fallback choices->message (phòng khi API trả dạng chat)
+            if not reply:
+                reply = (data.get("choices") or [{}])[0].get("message", {}).get("content")
+
+            reply = reply or "Mình đang ở đây, sẵn sàng hỗ trợ bạn!"
             return data, reply
 
+        # --- Fallback: /v1/chat/completions
         print(f"❌ responses body: {r.text[:800]}")
-        # Fallback sang chat.completions
         chat_msgs = _to_chat_messages(messages)
         rc = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -383,9 +434,11 @@ def call_openai(messages, temperature=0.7):
 
         print(f"❌ chat body: {rc.text[:800]}")
         return {}, "Xin lỗi, hiện mình gặp chút trục trặc. Bạn nhắn lại giúp mình nhé!"
+
     except Exception as e:
         print("❌ OpenAI error:", repr(e))
         return {}, "Xin lỗi, hiện mình gặp chút trục trặc. Bạn nhắn lại giúp mình nhé!"
+
 
 # === Rephrase mềm + emoji cute ===
 EMOJI_SETS = {
@@ -759,8 +812,8 @@ def compose_new_arrivals(lang: str = "vi", items=None):
         title = d.get("title") or "Sản phẩm"
         stock = _stock_line(d)
         pval  = _price_value(d)
-        currency = d.get("currency") or ("₫" if lang == "vi" else "")
-        pstr  = _fmt_price(pval, currency) if pval is not None else None
+        symbol = _currency_symbol_for_doc(d, lang)  # <--- dùng symbol
+        pstr  = _fmt_price(pval, symbol) if pval is not None else None
 
         line = f"• {title}"
         if pstr: line += f" — {pstr}"
@@ -769,7 +822,6 @@ def compose_new_arrivals(lang: str = "vi", items=None):
 
     raw = f"{t(lang,'new_hdr')}\n" + "\n".join(lines) + "\n\n" + t(lang,"product_pts")
     return rephrase_casual(raw, intent="product", lang=lang)
-
 
 
 # ========= INTENT, PERSONA, FEW-SHOT & NATURAL REPLY =========
@@ -902,7 +954,19 @@ LANG_STRINGS["id"]["price_hint"] = "Harga referensi: {price}"
 LANG_STRINGS["ko"]["price_hint"] = "참고 가격: {price}"
 LANG_STRINGS["ja"]["price_hint"] = "参考価格：{price}"
 
+# --- Currency symbol map ---
+CURRENCY_SYMBOL = {
+    "VND": "đ", "USD": "$", "EUR": "€", "GBP": "£",
+    "TWD": "NT$", "THB": "฿", "IDR": "Rp", "JPY": "¥", "KRW": "₩", "CNY": "¥"
+}
 
+def _currency_symbol_from_lang(lang: str) -> str:
+    # fallback theo ngôn ngữ nếu không có currency trong meta
+    return "đ" if lang == "vi" else ""
+
+def _currency_symbol_for_doc(d: dict, lang: str) -> str:
+    code = (d.get("currency") or "").upper().strip()
+    return CURRENCY_SYMBOL.get(code) or _currency_symbol_from_lang(lang)
 
 def t(lang: str, key: str, **kw) -> str:
     lang2 = lang if lang in LANG_STRINGS else DEFAULT_LANG
@@ -1106,18 +1170,18 @@ def _stock_line(d: dict) -> str:
 def _shorten(txt: str, n=280) -> str:
     t = (txt or "").strip()
     return (t[:n].rstrip() + "…") if len(t) > n else t
-def _fmt_price(p, currency="₫"):
+def _fmt_price(p, symbol=""):
     if p is None:
         return None
     try:
-        # nếu p là string: chỉ giữ chữ số
-        s = re.sub(r"\D", "", str(p))
-        if not s:
+        digits = re.sub(r"\D", "", str(p))
+        if not digits:
             return None
-        val = int(float(s))
-        return f"{val:,.0f}".replace(",", ".") + (f" {currency}" if currency else "")
+        val = int(float(digits))
+        return f"{val:,.0f}".replace(",", ".") + (f" {symbol}" if symbol else "")
     except Exception:
         return None
+
 
 def _extract_price_number(txt: str):
     """Bắt 199k / 199.000đ / 1,299,000 VND… → số (float)."""
@@ -1408,9 +1472,6 @@ def compose_product_reply(hits, lang: str = "vi"):
     if not hits:
         return t(lang, "fallback")
 
-    # Ưu tiên currency trong meta; nếu không có, mặc định ₫ cho VI
-    currency = (hits[0].get("currency") or ("₫" if lang == "vi" else ""))
-
     items = []
     for d in hits[:2]:
         title     = d.get("title") or "Sản phẩm"
@@ -1418,7 +1479,8 @@ def compose_product_reply(hits, lang: str = "vi"):
         stock     = _stock_line(d)
 
         price_val = _price_value(d)
-        price_str = _fmt_price(price_val, currency) if price_val is not None else None
+        symbol    = _currency_symbol_for_doc(d, lang)   # <---
+        price_str = _fmt_price(price_val, symbol) if price_val is not None else None
 
         line = f"• {title}"
         if variant:
@@ -1431,17 +1493,19 @@ def compose_product_reply(hits, lang: str = "vi"):
     raw = f"{t(lang,'suggest_hdr')}\n" + "\n".join(items) + "\n\n" + t(lang,"product_pts")
     return rephrase_casual(raw, intent="product", lang=lang)
 
+
 def compose_product_info(hits, lang: str = "vi"):
     if not hits:
         return t(lang, "fallback")
 
     d = hits[0]
-    currency   = d.get("currency") or ("₫" if lang == "vi" else "")
-    title      = d.get("title") or "Sản phẩm"
-    stock      = _stock_line(d)
+    title = d.get("title") or "Sản phẩm"
+    stock = _stock_line(d)
 
-    price_val  = _price_value(d)
-    price_line = t(lang, "price_hint", price=_fmt_price(price_val, currency)) if price_val is not None else ""
+    price_val = _price_value(d)
+    symbol    = _currency_symbol_for_doc(d, lang)  # <---
+    price_line = t(lang, "price_hint", price=_fmt_price(price_val, symbol)) if price_val is not None else ""
+
     bullets = _extract_features_from_text(d.get("text",""))
     body    = "\n".join(bullets) if bullets else "• Thiết kế tối giản, dễ phối đồ\n• Chất liệu thoáng, dễ vệ sinh"
 
@@ -1477,9 +1541,9 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
         return t(lang, "fallback"), []
 
     main = hits[0]
-    currency = main.get("currency") or ("₫" if lang == "vi" else "")
+    symbol = _currency_symbol_for_doc(main, lang)  # <---
     main_price = _price_value(main)
-    main_price_str = _fmt_price(main_price, currency) if main_price is not None else "đang cập nhật"
+    main_price_str = _fmt_price(main_price, symbol) if main_price is not None else "đang cập nhật"
 
     low, high = _minmax_in_category(main)
 
@@ -1487,14 +1551,13 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
     title = main.get("title") or "Sản phẩm"
     lines.append(f"Vâng ạ, **{title}** đang được shop bán với **giá công khai: {main_price_str}**.")
 
-    # Gợi ý cùng dòng (chỉ thêm khi có giá hợp lệ)
     sug = []
     if high:
-        hv = _fmt_price(_price_value(high), currency)
+        hv = _fmt_price(_price_value(high), symbol)  # <---
         if hv:
             sug.append(f"• **Cùng dòng – giá cao nhất:** {high.get('title','SP')} — {hv}")
     if low:
-        lv = _fmt_price(_price_value(low), currency)
+        lv = _fmt_price(_price_value(low), symbol)   # <---
         if lv:
             sug.append(f"• **Cùng dòng – giá thấp nhất:** {low.get('title','SP')} — {lv}")
 
@@ -1504,10 +1567,9 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
 
     lines.append(t(lang, "product_pts"))
     raw = "\n".join(lines)
-
-    # Nút xem nhanh (SP chính + 1–2 gợi ý nếu có)
     btns = [main] + [x for x in (high, low) if x]
     return rephrase_casual(raw, intent="product", lang=lang), btns[:2]
+
 
 def answer_with_rag(user_id, user_question):
     s = _get_sess(user_id)
