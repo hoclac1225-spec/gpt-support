@@ -1,4 +1,3 @@
- 
 # -*- coding: utf-8 -*-
 import unicodedata
 import os, json, time, re, requests, numpy as np, faiss, threading, random
@@ -7,111 +6,28 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from openai import OpenAI
-import hmac, hashlib
+import hmac, hashlib, base64
 from typing import Optional
 from ingest_products import fetch_all_products, build_docs, dedup_docs, save_faiss
-from flask import make_response
+
+
 # --- Flask & CORS ---
 app = Flask(__name__)
-
-cors_opts = {
-    "origins": [
-        r"^https://([a-z0-9-]+\.)?aloha\.id\.vn$",
-        "https://9mn9fa-6p.myshopify.com",
-    ],
-    "supports_credentials": True,
-    "allow_headers": [
-        "Content-Type", "Authorization", "X-Admin-Token",
-        "X-Requested-With", "Accept", "Origin", "Referer"
-    ],
-    "methods": ["GET", "POST", "OPTIONS"],
-    "max_age": 3600,
-}
-
-# LƯU Ý: dùng /api/.* thay vì /api/*
-
 CORS(app, resources={
-    r"/api/.*": cors_opts,
-    r"/admin/.*": cors_opts,
+    r"/api/*": {
+        "origins": [
+            "https://aloha.id.vn",
+            "https://www.aloha.id.vn",
+            "https://9mn9fa-6p.myshopify.com",
+        ],
+        "supports_credentials": True,
+        "allow_headers": ["Content-Type", "Authorization", "X-Admin-Token"],
+        "methods": ["GET", "POST", "OPTIONS"],
+    }
 })
 
-ALLOWED_ORIGIN_RE = re.compile(r"^https://([a-z0-9-]+\.)?aloha\.id\.vn$")
-
-def _allow_origin(origin: str) -> bool:
-    if not origin:
-        return False
-    if origin == "https://9mn9fa-6p.myshopify.com":
-        return True
-    return bool(ALLOWED_ORIGIN_RE.match(origin))
-
-@app.after_request
-def add_cors_headers(resp):
-    origin = request.headers.get("Origin", "")
-    if _allow_origin(origin):
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Headers"] = (
-    "Content-Type, Authorization, X-Admin-Token, X-Requested-With, Accept, Origin, Referer")
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        resp.headers["Access-Control-Max-Age"] = "3600"
-    return resp
-
-# Bắt mọi preflight dưới /api/* và /admin/* (phản hồi nhanh 204)
-@app.route("/api/<path:subpath>", methods=["OPTIONS"], provide_automatic_options=False)
-def api_preflight(subpath):
-    resp = make_response("", 204)
-    return resp
-
-@app.route("/admin/<path:subpath>", methods=["OPTIONS"])
-def admin_preflight(subpath):
-    resp = make_response("", 204)
-    return resp
 # Load .env TRƯỚC khi đọc os.getenv
 load_dotenv()
-
-from langdetect import detect, DetectorFactory
-DetectorFactory.seed = 0  # cố định seed để kết quả ổn định
-
-# --- Ngôn ngữ hỗ trợ ---
-_supported = os.getenv("SUPPORTED_LANGS", "vi,en,zh,th,id,ko,ja")
-SUPPORTED_LANGS = [s.strip() for s in _supported.split(",") if s.strip()]
-
-DEFAULT_LANG = os.getenv("DEFAULT_LANG", "vi")
-if DEFAULT_LANG not in SUPPORTED_LANGS:
-    SUPPORTED_LANGS.append(DEFAULT_LANG)
-
-
-def detect_lang(text: str) -> str:
-    """
-    Tự động nhận diện ngôn ngữ đầu vào.
-    Nếu không chắc chắn -> fallback về DEFAULT_LANG.
-    """
-    txt = (text or "").strip()
-    if not txt:
-        return DEFAULT_LANG
-    try:
-        lang = detect(txt)
-        # Chuẩn hóa một số mã trả về khác nhau
-        lang = {"zh-cn": "zh", "zh-tw": "zh", "pt-br": "pt"}.get(lang, lang)
-        return lang if lang in SUPPORTED_LANGS else DEFAULT_LANG
-    except Exception:
-        # Fallback regex nhẹ cho CJK/TH/KO/JA/VI/ID
-        if re.search(r"[\u4e00-\u9fff]", txt):  
-            return "zh" if "zh" in SUPPORTED_LANGS else DEFAULT_LANG
-        if re.search(r"[\u0E00-\u0E7F]", txt):  
-            return "th" if "th" in SUPPORTED_LANGS else DEFAULT_LANG
-        if re.search(r"[\uac00-\ud7af]", txt):  
-            return "ko" if "ko" in SUPPORTED_LANGS else DEFAULT_LANG
-        if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", txt):  
-            return "ja" if "ja" in SUPPORTED_LANGS else DEFAULT_LANG
-        if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệ"
-                     r"óòỏõọốồổỗộơóờởỡợíìỉĩịúùủũụưứừửữự"
-                     r"ýỳỷỹỵ]", txt, flags=re.I):
-            return "vi" if "vi" in SUPPORTED_LANGS else DEFAULT_LANG
-        if re.search(r"\b(yang|dan|tidak|saja|terima|kasih)\b", txt.lower()):
-            return "id" if "id" in SUPPORTED_LANGS else DEFAULT_LANG
-        return "en" if "en" in SUPPORTED_LANGS else DEFAULT_LANG
 
 
 # --- text normalize helpers (có & không dấu)
@@ -171,8 +87,8 @@ def _score_gate(q: str, hits: list, best: float) -> bool:
 
 
 # --- Title overlap config (đặt ở cấp module, sau load_dotenv) ---
-TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "3"))
-TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.30"))
+TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "2"))
+TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.25"))
 TITLE_MAX_CHECK = int(os.getenv("TITLE_MAX_CHECK", "5"))
 
 def _has_title_overlap(
@@ -269,17 +185,16 @@ VECTOR_DIR       = os.getenv("VECTOR_DIR", "./vectors")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_STORE", "")  # domain *.myshopify.com (tham chiếu)
 # Link shop mặc định (fallback)
 SHOP_URL         = os.getenv("SHOP_URL", "https://shop.aloha.id.vn/zh")
-
+# Đa ngôn ngữ
+SUPPORTED_LANGS  = [s.strip() for s in os.getenv("SUPPORTED_LANGS", "vi,en,zh,th,id").split(",")]
+DEFAULT_LANG     = os.getenv("DEFAULT_LANG", "vi")
 SHOP_URL_MAP = {
     "vi": os.getenv("SHOP_URL_VI", SHOP_URL),
     "en": os.getenv("SHOP_URL_EN", SHOP_URL),
     "zh": os.getenv("SHOP_URL_ZH", SHOP_URL),
     "th": os.getenv("SHOP_URL_TH", SHOP_URL),
     "id": os.getenv("SHOP_URL_ID", SHOP_URL),
-    "ko": os.getenv("SHOP_URL_KO", SHOP_URL),
-    "ja": os.getenv("SHOP_URL_JA", SHOP_URL),
 }
-
 # --- Always-answer & shop identity ---
 ALWAYS_ANSWER = os.getenv("ALWAYS_ANSWER", "true").lower() == "true"
 SHOP_NAME = os.getenv("SHOP_NAME", "Aloha")
@@ -297,12 +212,11 @@ def shop_identity(lang: str):
     )
 
 
-REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "false").lower() == "true"
-
+REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "true").lower() == "true"
 EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 
 # Lọc & ngưỡng điểm
-SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.34"))
+SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.28"))
 STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
 
 # ...
@@ -360,21 +274,13 @@ def _remember(user_id, role, text):
 
 # ========= OPENAI WRAPPER =========
 def _to_chat_messages(messages):
-    """Chuyển về định dạng chat.completions; chấp nhận cả content=str hoặc content=[{type,text}]."""
+    """Chuyển format responses -> chat.completions để fallback."""
     chat_msgs = []
-    ALLOWED = {"input_text", "output_text", "text"}
+    ALLOWED = {"input_text", "output_text", "text"}  # <-- thêm output_text
     for m in messages:
         role = m.get("role", "user")
-        content = m.get("content", "")
-        if isinstance(content, str):
-            text = content.strip()
-        else:
-            # content là list các part
-            parts = []
-            for p in content or []:
-                if isinstance(p, dict) and p.get("type") in ALLOWED:
-                    parts.append(p.get("text", ""))
-            text = "\n".join(parts).strip()
+        parts = m.get("content", [])
+        text = "\n".join([p.get("text","") for p in parts if p.get("type") in ALLOWED]).strip()
         chat_msgs.append({"role": role, "content": text})
     return chat_msgs
 
@@ -386,39 +292,21 @@ def call_openai(messages, temperature=0.7):
     """
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": OPENAI_MODEL, "input": messages, "temperature": temperature}
-
     try:
         t0 = time.time()
         r = requests.post(OPENAI_URL, headers=headers, json=payload, timeout=40)
         dt = (time.time() - t0) * 1000
         print(f"🔁 OpenAI responses status={r.status_code} in {dt:.0f}ms")
-
         if r.status_code == 200:
             data = r.json()
-            reply = None
-
-            # 1) output_text (nếu có)
-            reply = data.get("output_text")
-
-            # 2) parts: data["output"][0]["content"] -> list[{type,text}]
             try:
-                parts = (data.get("output") or [{}])[0].get("content") or []
-                if not reply and isinstance(parts, list):
-                    texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
-                    joined = "\n".join([t for t in texts if t]).strip()
-                    reply = joined or None
+                reply = data["output"][0]["content"][0]["text"]
             except Exception:
-                pass
-
-            # 3) fallback choices->message (phòng khi API trả dạng chat)
-            if not reply:
-                reply = (data.get("choices") or [{}])[0].get("message", {}).get("content")
-
-            reply = reply or "Mình đang ở đây, sẵn sàng hỗ trợ bạn!"
+                reply = data.get("output_text") or "Mình đang ở đây, sẵn sàng hỗ trợ bạn!"
             return data, reply
 
-        # --- Fallback: /v1/chat/completions
         print(f"❌ responses body: {r.text[:800]}")
+        # Fallback sang chat.completions
         chat_msgs = _to_chat_messages(messages)
         rc = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -434,11 +322,9 @@ def call_openai(messages, temperature=0.7):
 
         print(f"❌ chat body: {rc.text[:800]}")
         return {}, "Xin lỗi, hiện mình gặp chút trục trặc. Bạn nhắn lại giúp mình nhé!"
-
     except Exception as e:
         print("❌ OpenAI error:", repr(e))
         return {}, "Xin lỗi, hiện mình gặp chút trục trặc. Bạn nhắn lại giúp mình nhé!"
-
 
 # === Rephrase mềm + emoji cute ===
 EMOJI_SETS = {
@@ -461,8 +347,7 @@ def rephrase_casual(text: str, intent="generic", temperature=0.7, lang: str = No
     try:
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
         msgs = [
-            {"role":"system","content":f"Bạn là trợ lý bán hàng, **luôn trả lời bằng ngôn ngữ: {lang or 'vi'}**, văn phong thân thiện, ngắn gọn, 1–2 emoji."},
-
+            {"role":"system","content":f"Bạn là trợ lý bán hàng, viết {lang or 'vi'} tự nhiên, thân thiện, ngắn gọn; thêm 1–2 emoji phù hợp (không lạm dụng). Giữ nguyên dữ kiện/giá, không bịa."},
             {"role":"user","content": f"Viết lại đoạn sau bằng {lang or 'vi'} theo giọng thân thiện, kết thúc bằng 1 câu chốt hành động.\n---\n{text}\n---\n{em(intent,2)}"}
         ]
         r = requests.post(
@@ -581,16 +466,16 @@ def _safe_read_index(prefix):
             print(f"⚠️ Missing index/meta for '{prefix}'")
             return None, None
         idx  = faiss.read_index(idx_path)
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
+        meta = json.load(open(meta_path, encoding="utf-8"))
 
+        # --- Áp canonical domain cho mọi URL trong meta ---
         meta = _apply_canonical_urls(meta)
+
         print(f"✅ {prefix} loaded: {len(meta)} chunks")
         return idx, meta
     except Exception as e:
         print(f"❌ Load index '{prefix}':", repr(e))
         return None, None
-
     
 IDX_PROD, META_PROD = _safe_read_index("products")
 IDX_POL,  META_POL  = _safe_read_index("policies")
@@ -621,85 +506,32 @@ def _admin_ok(req):
     token = hdr or qp
     return (not ADMIN_TOKEN) or (token == ADMIN_TOKEN)
 
-# --- Admin auth vẫn dùng helper có sẵn ---
-# def _admin_ok(req): ... (giữ nguyên)
-
-# ================== RELOAD ==================
-# ================== RELOAD ==================
 @app.post("/admin/reload_vectors")
 def admin_reload_vectors():
     if not _admin_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     ok = _reload_vectors()
-    return jsonify({
-        "ok": ok,
-        "products_chunks": len(META_PROD) if META_PROD else 0,
-        "policies_chunks": len(META_POL) if META_POL else 0
-    })
+    return jsonify({"ok": ok})
 
-# ================== REBUILD (sync) ==================
 @app.post("/admin/rebuild_vectors_now")
 def admin_rebuild_vectors_now():
     if not _admin_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     try:
         t0 = time.time()
-      
-        clear = (request.args.get("clear", "0") == "1")
-
         products = fetch_all_products()
         docs = dedup_docs(build_docs(products))
-
         os.makedirs(VECTOR_DIR, exist_ok=True)
-        if clear:
-            for fn in ("products.index", "products.meta.json"):
-                fp = os.path.join(VECTOR_DIR, fn)
-                try:
-                    if os.path.exists(fp): os.remove(fp)
-                except Exception:
-                    pass
-
-        vectors_saved = save_faiss(
+        save_faiss(
             docs,
             os.path.join(VECTOR_DIR, "products.index"),
             os.path.join(VECTOR_DIR, "products.meta.json"),
-        ) or len(docs)
-
-        _reload_vectors()
-        return jsonify({
-            "ok": True,
-            "chunks": len(docs),
-            "vectors_saved": int(vectors_saved),
-            "t": round(time.time() - t0, 1)
-        })
+        )
+        return jsonify({"ok": True, "chunks": len(docs), "t": round(time.time() - t0, 1)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ================== REBUILD (async) ==================
-from threading import Thread
 
-@app.post("/admin/rebuild_vectors_async")
-def admin_rebuild_vectors_async():
-    if not _admin_ok(request):
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    def job():
-        try:
-            products = fetch_all_products()
-            docs = dedup_docs(build_docs(products))
-            os.makedirs(VECTOR_DIR, exist_ok=True)
-            save_faiss(
-                docs,
-                os.path.join(VECTOR_DIR, "products.index"),
-                os.path.join(VECTOR_DIR, "products.meta.json"),
-            )
-            _reload_vectors()
-            print(f"[rebuild_async] done, saved={len(docs)}")
-        except Exception as e:
-            print("[rebuild_async] error:", repr(e))
-
-    Thread(target=job, daemon=True).start()
-    return jsonify({"ok": True, "status": "started"})
 
 
 def _embed_query(q: str) -> Optional[np.ndarray]:
@@ -746,25 +578,24 @@ def retrieve_context(question, topk=6):
         return ""
 
     v = _embed_query(question)
-    if v is None:
+    if v is None:  # >>> thêm dòng an toàn
         return ""
 
     ctx = []
     if IDX_PROD is not None:
         try:
             _, Ip = IDX_PROD.search(v, topk)
-            ctx += [META_PROD[i]["text"] for i in Ip[0] if 0 <= i < len(META_PROD)]
+            ctx += [META_PROD[i]["text"] for i in Ip[0] if i >= 0]
         except Exception as e:
             print("⚠️ search products:", repr(e))
     if IDX_POL is not None:
         try:
             _, Ik = IDX_POL.search(v, topk)
-            ctx += [META_POL[i]["text"] for i in Ik[0] if 0 <= i < len(META_POL)]
+            ctx += [META_POL[i]["text"] for i in Ik[0] if i >= 0]
         except Exception as e:
             print("⚠️ search policies:", repr(e))
     print("🧠 ctx pieces:", len(ctx))
     return "\n\n".join(ctx[:topk]) if ctx else ""
-
 def _parse_ts(s):
     try:
         s = (s or "").replace("Z", "").replace("T", " ")
@@ -812,8 +643,8 @@ def compose_new_arrivals(lang: str = "vi", items=None):
         title = d.get("title") or "Sản phẩm"
         stock = _stock_line(d)
         pval  = _price_value(d)
-        symbol = _currency_symbol_for_doc(d, lang)  # <--- dùng symbol
-        pstr  = _fmt_price(pval, symbol) if pval is not None else None
+        currency = d.get("currency") or ("₫" if lang == "vi" else "")
+        pstr  = _fmt_price(pval, currency) if pval is not None else None
 
         line = f"• {title}"
         if pstr: line += f" — {pstr}"
@@ -824,6 +655,7 @@ def compose_new_arrivals(lang: str = "vi", items=None):
     return rephrase_casual(raw, intent="product", lang=lang)
 
 
+
 # ========= INTENT, PERSONA, FEW-SHOT & NATURAL REPLY =========
 GREETS = {"hi","hello","hey","helo","heloo","hí","hì","chào","xin chào","alo","aloha","hello bot","hi bot"}
 def is_greeting(text: str) -> bool:
@@ -831,6 +663,19 @@ def is_greeting(text: str) -> bool:
     return any(w in t for w in GREETS) and len(t) <= 40
 
 # ——— Ngôn ngữ: detect & câu chữ
+def detect_lang(text: str) -> str:
+    txt = (text or "").strip()
+    if not txt: return DEFAULT_LANG
+    if re.search(r"[\u4e00-\u9fff]", txt):  # CJK
+        return "zh" if "zh" in SUPPORTED_LANGS else DEFAULT_LANG
+    if re.search(r"[\u0E00-\u0E7F]", txt):  # Thai
+        return "th" if "th" in SUPPORTED_LANGS else DEFAULT_LANG
+    if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộơóờởỡợíìỉĩịúùủũụưứừửữựýỳỷỹỵ]", txt, flags=re.I):
+        return "vi" if "vi" in SUPPORTED_LANGS else DEFAULT_LANG
+    if re.search(r"\b(yang|dan|tidak|saja|terima|kasih)\b", txt.lower()):
+        return "id" if "id" in SUPPORTED_LANGS else DEFAULT_LANG
+    return "en" if "en" in SUPPORTED_LANGS else DEFAULT_LANG
+
 
 # ====== MULTI-LANG PATTERNS (smalltalk & new arrivals) ======
 # Mỗi ngôn ngữ là 1 list regex. Có thể bổ sung dần mà không đụng chỗ khác.
@@ -914,59 +759,8 @@ LANG_STRINGS = {
         "btn_view": "Lihat produk",
         "quick_view": "Lihat cepat:",
     },
-        "ko": {
-        "greet": "안녕하세요 👋 무엇을 도와드릴까요? 🙂",
-        "browse": "스토어를 둘러보세요 🛍️ 👉 {url}",
-        "oos": "죄송해요 🙏 해당 상품은 현재 **품절**입니다. 비슷한 상품을 여기서 확인해 보세요 👉 {url} ✨",
-        "fallback": "정보가 조금 부족해요 🤔. 원하는 스타일/재질/사이즈를 알려주시면 더 정확히 추천해 드릴게요 ✨",
-        "suggest_hdr": "이런 옵션을 추천드려요",
-        "product_pts": "슬림/스포티 중 어떤 스타일이 좋으세요? 색상/사이즈도 골라드릴게요.",
-        "highlights": "{title} 주요 포인트",
-        "policy_hint": "스토어 정책:",
-        "smalltalk_hi": "안녕하세요 👋 잘 지내고 있어요 😄",
-        "smalltalk_askback": "오늘 하루는 어떠세요?",
-        "new_hdr": "신상품 ✨",
-        "btn_view": "상품 보기",
-        "quick_view": "빠른 보기:",
-    },
-    "ja": {
-        "greet": "こんにちは 👋 何をお手伝いできますか？ 🙂",
-        "browse": "ストアをご覧ください 🛍️ 👉 {url}",
-        "oos": "すみません 🙏 その商品は現在**在庫切れ**です。こちらから似た商品をご覧ください 👉 {url} ✨",
-        "fallback": "もう少し情報が必要です 🤔。スタイル/素材/サイズを教えていただければ、より正確にご提案します ✨",
-        "suggest_hdr": "こちらのオプションがおすすめです",
-        "product_pts": "スリム or スポーティ、どちらが好みですか？色・サイズの絞り込みもできます。",
-        "highlights": "{title} のポイント",
-        "policy_hint": "ストアポリシー：",
-        "smalltalk_hi": "こんにちは 👋 元気です 😄",
-        "smalltalk_askback": "今日はどんな一日ですか？",
-        "new_hdr": "新着アイテム ✨",
-        "btn_view": "商品を見る",
-        "quick_view": "クイックビュー：",
-    },
-
-}
-LANG_STRINGS["vi"]["price_hint"] = "Giá tham khảo: {price}"
-LANG_STRINGS["en"]["price_hint"] = "Reference price: {price}"
-LANG_STRINGS["zh"]["price_hint"] = "参考价格：{price}"
-LANG_STRINGS["th"]["price_hint"] = "ราคาโดยอ้างอิง: {price}"
-LANG_STRINGS["id"]["price_hint"] = "Harga referensi: {price}"
-LANG_STRINGS["ko"]["price_hint"] = "참고 가격: {price}"
-LANG_STRINGS["ja"]["price_hint"] = "参考価格：{price}"
-
-# --- Currency symbol map ---
-CURRENCY_SYMBOL = {
-    "VND": "đ", "USD": "$", "EUR": "€", "GBP": "£",
-    "TWD": "NT$", "THB": "฿", "IDR": "Rp", "JPY": "¥", "KRW": "₩", "CNY": "¥"
 }
 
-def _currency_symbol_from_lang(lang: str) -> str:
-    # fallback theo ngôn ngữ nếu không có currency trong meta
-    return "đ" if lang == "vi" else ""
-
-def _currency_symbol_for_doc(d: dict, lang: str) -> str:
-    code = (d.get("currency") or "").upper().strip()
-    return CURRENCY_SYMBOL.get(code) or _currency_symbol_from_lang(lang)
 
 def t(lang: str, key: str, **kw) -> str:
     lang2 = lang if lang in LANG_STRINGS else DEFAULT_LANG
@@ -1030,19 +824,6 @@ SMALLTALK_PATTERNS = {
         r"(terima\s*kasih|terimakasih|trimakasih|makasih|makasi|thanks?|thank you|thx|ty)",
         r"(wkwk+|wk+|haha+|hehe+|:d)|[😂🤣😆]",
     ],
-        "ko": [
-        r"(안녕|안녕하세요|하이|헬로)",
-        r"(요즘 어때|잘 지내|기분 어때)",
-        r"(고마워|감사|땡큐|thanks?|thank you|thx|ty)",
-        r"(ㅋㅋ+|ㅎㅎ+|하하+)|[😂🤣😆]",
-    ],
-    "ja": [
-        r"(こんにちは|こんちは|もしもし|やあ|ハロー)",
-        r"(元気ですか|調子どう|最近どう)",
-        r"(ありがとう|有難う|サンキュー|thanks?|thank you|thx|ty)",
-        r"(笑|ｗｗ+|はは+)|[😂🤣😆]",
-    ],
-
 }
 
 NEW_ITEMS_PATTERNS = {
@@ -1085,14 +866,14 @@ def is_price_question(text: str, lang: str) -> bool:
     return any(re.search(p, raw, flags=re.I) for p in _pat(PRICE_PATTERNS, lang))
 
 
-# Thay SYSTEM_STYLE hiện tại bằng bản trung tính:
 SYSTEM_STYLE = (
-    "You are Aloha shop's sales assistant (Aloha Bot). Tone: friendly, proactive, concise, "
-    "use 1–3 context-appropriate emojis (no overuse). Always ground answers in CONTEXT; never fabricate. "
-    "Do NOT state price/stock/specs unless they are present in CONTEXT; if missing, ask a short clarifying question "
-    "or invite the user to view the store link. Use bullet points when listing; end with a single call-to-action."
+    "Bạn là trợ lý bán hàng Aloha tên là Aloha Bot. Tông giọng: thân thiện, chủ động, "
+    "trả lời ngắn gọn như người thật; dùng 1–3 emoji hợp ngữ cảnh (không lạm dụng). "
+    "Luôn dựa vào CONTEXT (nội dung RAG). Không bịa. "
+    "KHÔNG được nêu giá/tồn kho/thuộc tính cụ thể nếu CONTEXT không có dữ kiện; "
+    "khi thiếu dữ kiện thì hỏi lại 1 câu làm rõ hoặc mời xem link cửa hàng. "
+    "Trình bày dễ đọc: gạch đầu dòng khi liệt kê; 1 câu chốt hành động."
 )
-
 # FEW_SHOT_EXAMPLES
 FEW_SHOT_EXAMPLES = [
     {"role":"user","content":[{"type":"input_text","text":"helo"}]},
@@ -1170,18 +951,18 @@ def _stock_line(d: dict) -> str:
 def _shorten(txt: str, n=280) -> str:
     t = (txt or "").strip()
     return (t[:n].rstrip() + "…") if len(t) > n else t
-def _fmt_price(p, symbol=""):
+def _fmt_price(p, currency="₫"):
     if p is None:
         return None
     try:
-        digits = re.sub(r"\D", "", str(p))
-        if not digits:
+        # nếu p là string: chỉ giữ chữ số
+        s = re.sub(r"\D", "", str(p))
+        if not s:
             return None
-        val = int(float(digits))
-        return f"{val:,.0f}".replace(",", ".") + (f" {symbol}" if symbol else "")
+        val = int(float(s))
+        return f"{val:,.0f}".replace(",", ".") + (f" {currency}" if currency else "")
     except Exception:
         return None
-
 
 def _extract_price_number(txt: str):
     """Bắt 199k / 199.000đ / 1,299,000 VND… → số (float)."""
@@ -1472,6 +1253,9 @@ def compose_product_reply(hits, lang: str = "vi"):
     if not hits:
         return t(lang, "fallback")
 
+    # Ưu tiên currency trong meta; nếu không có, mặc định ₫ cho VI
+    currency = (hits[0].get("currency") or ("₫" if lang == "vi" else ""))
+
     items = []
     for d in hits[:2]:
         title     = d.get("title") or "Sản phẩm"
@@ -1479,8 +1263,7 @@ def compose_product_reply(hits, lang: str = "vi"):
         stock     = _stock_line(d)
 
         price_val = _price_value(d)
-        symbol    = _currency_symbol_for_doc(d, lang)   # <---
-        price_str = _fmt_price(price_val, symbol) if price_val is not None else None
+        price_str = _fmt_price(price_val, currency) if price_val is not None else None
 
         line = f"• {title}"
         if variant:
@@ -1493,18 +1276,17 @@ def compose_product_reply(hits, lang: str = "vi"):
     raw = f"{t(lang,'suggest_hdr')}\n" + "\n".join(items) + "\n\n" + t(lang,"product_pts")
     return rephrase_casual(raw, intent="product", lang=lang)
 
-
 def compose_product_info(hits, lang: str = "vi"):
     if not hits:
         return t(lang, "fallback")
 
     d = hits[0]
-    title = d.get("title") or "Sản phẩm"
-    stock = _stock_line(d)
+    currency   = d.get("currency") or ("₫" if lang == "vi" else "")
+    title      = d.get("title") or "Sản phẩm"
+    stock      = _stock_line(d)
 
-    price_val = _price_value(d)
-    symbol    = _currency_symbol_for_doc(d, lang)  # <---
-    price_line = t(lang, "price_hint", price=_fmt_price(price_val, symbol)) if price_val is not None else ""
+    price_val  = _price_value(d)
+    price_line = f"Giá tham khảo: {_fmt_price(price_val, currency)}" if price_val is not None else ""
 
     bullets = _extract_features_from_text(d.get("text",""))
     body    = "\n".join(bullets) if bullets else "• Thiết kế tối giản, dễ phối đồ\n• Chất liệu thoáng, dễ vệ sinh"
@@ -1525,15 +1307,10 @@ def compose_product_info(hits, lang: str = "vi"):
 
 
 def compose_contextual_answer(context, question, history, lang="vi"):
-    # ép ngôn ngữ ở system
-    lang_sys = f"Always answer in the user's language: {lang}. If the user mixes languages, stick to {lang}."
     ctx = (shop_identity(lang) + "\n" + (context or "")).strip()
-    # gộp system ép ngôn ngữ + style
-    sys = lang_sys + "\n" + SYSTEM_STYLE
-    msgs = build_messages(sys, history, ctx, question)
+    msgs = build_messages(SYSTEM_STYLE, history, ctx, question)
     _, reply = call_openai(msgs, temperature=0.6)
     return reply
-
 
 
 def compose_price_with_suggestions(hits, lang: str = "vi"):
@@ -1541,36 +1318,32 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
         return t(lang, "fallback"), []
 
     main = hits[0]
-    symbol = _currency_symbol_for_doc(main, lang)  # <---
+    currency = main.get("currency") or ("₫" if lang == "vi" else "")
     main_price = _price_value(main)
-    main_price_str = _fmt_price(main_price, symbol) if main_price is not None else "đang cập nhật"
+    main_price_str = _fmt_price(main_price, currency) if main_price is not None else "đang cập nhật"
 
     low, high = _minmax_in_category(main)
 
     lines = []
     title = main.get("title") or "Sản phẩm"
     lines.append(f"Vâng ạ, **{title}** đang được shop bán với **giá công khai: {main_price_str}**.")
-
     sug = []
     if high:
-        hv = _fmt_price(_price_value(high), symbol)  # <---
-        if hv:
-            sug.append(f"• **Cùng dòng – giá cao nhất:** {high.get('title','SP')} — {hv}")
+        hp = _fmt_price(_price_value(high), currency)
+        sug.append(f"• **Cùng dòng – giá cao nhất:** {high.get('title','SP')} — {hp}")
     if low:
-        lv = _fmt_price(_price_value(low), symbol)   # <---
-        if lv:
-            sug.append(f"• **Cùng dòng – giá thấp nhất:** {low.get('title','SP')} — {lv}")
+        lp = _fmt_price(_price_value(low), currency)
+        sug.append(f"• **Cùng dòng – giá thấp nhất:** {low.get('title','SP')} — {lp}")
 
     if sug:
         lines.append("Bạn cũng có thể tham khảo thêm:")
         lines += sug
-
     lines.append(t(lang, "product_pts"))
     raw = "\n".join(lines)
+
+    # Thêm SP chính vào button đầu tiên
     btns = [main] + [x for x in (high, low) if x]
     return rephrase_casual(raw, intent="product", lang=lang), btns[:2]
-
-
 def answer_with_rag(user_id, user_question):
     s = _get_sess(user_id)
     hist = s["hist"]
@@ -1591,10 +1364,12 @@ def answer_with_rag(user_id, user_question):
         items = get_new_arrivals(days=30, topk=4)
         return compose_new_arrivals(lang=lang, items=items), items[:2]
 
-    # --- PRODUCT SEARCH ---
+    # ——— PRODUCT SEARCH ———
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
     best = max(prod_scores or [0.0])
+
     ok_by_score = _score_gate(user_question, prod_hits, best)
+
 
     filtered_hits = filter_hits_by_query(prod_hits, user_question, lang=lang) if STRICT_MATCH else prod_hits
     # nếu STRICT_MATCH làm rỗng mà catalog là ZH → nới lọc
@@ -1602,26 +1377,27 @@ def answer_with_rag(user_id, user_question):
         filtered_hits = prod_hits
 
     title_ok = _has_title_overlap(user_question, prod_hits)
-
-    # --- CHỈ nạp CONTEXT khi cần thiết ---
-    context = ""
-    need_ctx = (intent == "policy") or (not filtered_hits) or (not ok_by_score and not title_ok)
-    if need_ctx:
-        context = retrieve_context(user_question, topk=6)
-
     # --- CỨU CÁNH THEO ĐIỂM ---
+    # nếu filter bị rỗng nhưng điểm đã đạt ngưỡng → giữ nguyên prod_hits
     if not filtered_hits and ok_by_score:
         filtered_hits = prod_hits
+
+
+    if intent == "other" and (filtered_hits or title_ok):
+        intent = "product"
+
     if title_ok and not filtered_hits:
         filtered_hits = prod_hits
 
-    print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}, need_ctx={need_ctx}")
+    print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
 
-    # --- POLICY ---
+    # --- CONTEXT/POLICY ---   # <— bỏ thụt vào đầu dòng
+    context = retrieve_context(user_question, topk=6)
     if intent == "policy" and context:
         ans = compose_contextual_answer(context, user_question, hist, lang=lang)
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
+
 
     # --- ƯU TIÊN HỎI GIÁ ---
     if is_price_question(user_question, lang) and (filtered_hits or title_ok):
@@ -1631,17 +1407,21 @@ def answer_with_rag(user_id, user_question):
         return reply, sug_hits
 
     # --- PRODUCT BRANCHES ---
+    # (nếu bạn đã thêm ok_by_score theo patch trước, dùng nó; chưa có thì thay ok_by_score bằng (best >= SCORE_MIN))
     not_enough = (not filtered_hits) or (not ok_by_score and not title_ok)
 
     if intent in {"product", "product_info"} and not_enough:
+        # 1) Có context → dùng LLM + context
         if context:
             print("➡️ route=ctx_fallback_from_product")
             ans = compose_contextual_answer(context, user_question, hist, lang=lang)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
+        # 2) Không có context → LLM trơn (shop_identity vẫn được chèn trong compose_contextual_answer)
         if ALWAYS_ANSWER:
             print("➡️ route=llm_fallback_from_product")
             ans = compose_contextual_answer("", user_question, hist, lang=lang)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
+        # 3) Cuối cùng mới rơi về OOS
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
         print("➡️ route=oos_hint")
         return t(lang, "oos", url=url), []
@@ -1665,7 +1445,6 @@ def answer_with_rag(user_id, user_question):
         ans = compose_contextual_answer("", user_question, hist, lang=lang)
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
     return t(lang, "fallback"), []
-
 
 
 # ========= WEBHOOK =========
