@@ -259,7 +259,8 @@ def shop_identity(lang: str):
     )
 
 
-REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "true").lower() == "true"
+REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "false").lower() == "true"
+
 EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 
 # Lọc & ngưỡng điểm
@@ -1015,14 +1016,14 @@ def is_price_question(text: str, lang: str) -> bool:
     return any(re.search(p, raw, flags=re.I) for p in _pat(PRICE_PATTERNS, lang))
 
 
+# Thay SYSTEM_STYLE hiện tại bằng bản trung tính:
 SYSTEM_STYLE = (
-    "Bạn là trợ lý bán hàng Aloha tên là Aloha Bot. Tông giọng: thân thiện, chủ động, "
-    "trả lời ngắn gọn như người thật; dùng 1–3 emoji hợp ngữ cảnh (không lạm dụng). "
-    "Luôn dựa vào CONTEXT (nội dung RAG). Không bịa. "
-    "KHÔNG được nêu giá/tồn kho/thuộc tính cụ thể nếu CONTEXT không có dữ kiện; "
-    "khi thiếu dữ kiện thì hỏi lại 1 câu làm rõ hoặc mời xem link cửa hàng. "
-    "Trình bày dễ đọc: gạch đầu dòng khi liệt kê; 1 câu chốt hành động."
+    "You are Aloha shop's sales assistant (Aloha Bot). Tone: friendly, proactive, concise, "
+    "use 1–3 context-appropriate emojis (no overuse). Always ground answers in CONTEXT; never fabricate. "
+    "Do NOT state price/stock/specs unless they are present in CONTEXT; if missing, ask a short clarifying question "
+    "or invite the user to view the store link. Use bullet points when listing; end with a single call-to-action."
 )
+
 # FEW_SHOT_EXAMPLES
 FEW_SHOT_EXAMPLES = [
     {"role":"user","content":[{"type":"input_text","text":"helo"}]},
@@ -1455,10 +1456,15 @@ def compose_product_info(hits, lang: str = "vi"):
 
 
 def compose_contextual_answer(context, question, history, lang="vi"):
+    # ép ngôn ngữ ở system
+    lang_sys = f"Always answer in the user's language: {lang}. If the user mixes languages, stick to {lang}."
     ctx = (shop_identity(lang) + "\n" + (context or "")).strip()
-    msgs = build_messages(SYSTEM_STYLE, history, ctx, question)
+    # gộp system ép ngôn ngữ + style
+    sys = lang_sys + "\n" + SYSTEM_STYLE
+    msgs = build_messages(sys, history, ctx, question)
     _, reply = call_openai(msgs, temperature=0.6)
     return reply
+
 
 
 def compose_price_with_suggestions(hits, lang: str = "vi"):
@@ -1518,12 +1524,10 @@ def answer_with_rag(user_id, user_question):
         items = get_new_arrivals(days=30, topk=4)
         return compose_new_arrivals(lang=lang, items=items), items[:2]
 
-    # ——— PRODUCT SEARCH ———
+    # --- PRODUCT SEARCH ---
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
     best = max(prod_scores or [0.0])
-
     ok_by_score = _score_gate(user_question, prod_hits, best)
-
 
     filtered_hits = filter_hits_by_query(prod_hits, user_question, lang=lang) if STRICT_MATCH else prod_hits
     # nếu STRICT_MATCH làm rỗng mà catalog là ZH → nới lọc
@@ -1531,23 +1535,26 @@ def answer_with_rag(user_id, user_question):
         filtered_hits = prod_hits
 
     title_ok = _has_title_overlap(user_question, prod_hits)
+
+    # --- CHỈ nạp CONTEXT khi cần thiết ---
+    context = ""
+    need_ctx = (intent == "policy") or (not filtered_hits) or (not ok_by_score and not title_ok)
+    if need_ctx:
+        context = retrieve_context(user_question, topk=6)
+
     # --- CỨU CÁNH THEO ĐIỂM ---
-    # nếu filter bị rỗng nhưng điểm đã đạt ngưỡng → giữ nguyên prod_hits
     if not filtered_hits and ok_by_score:
         filtered_hits = prod_hits
-
     if title_ok and not filtered_hits:
         filtered_hits = prod_hits
 
-    print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
+    print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}, need_ctx={need_ctx}")
 
-    # --- CONTEXT/POLICY ---   # <— bỏ thụt vào đầu dòng
-    context = retrieve_context(user_question, topk=6)
+    # --- POLICY ---
     if intent == "policy" and context:
         ans = compose_contextual_answer(context, user_question, hist, lang=lang)
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
-
 
     # --- ƯU TIÊN HỎI GIÁ ---
     if is_price_question(user_question, lang) and (filtered_hits or title_ok):
@@ -1557,21 +1564,17 @@ def answer_with_rag(user_id, user_question):
         return reply, sug_hits
 
     # --- PRODUCT BRANCHES ---
-    # (nếu bạn đã thêm ok_by_score theo patch trước, dùng nó; chưa có thì thay ok_by_score bằng (best >= SCORE_MIN))
     not_enough = (not filtered_hits) or (not ok_by_score and not title_ok)
 
     if intent in {"product", "product_info"} and not_enough:
-        # 1) Có context → dùng LLM + context
         if context:
             print("➡️ route=ctx_fallback_from_product")
             ans = compose_contextual_answer(context, user_question, hist, lang=lang)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
-        # 2) Không có context → LLM trơn (shop_identity vẫn được chèn trong compose_contextual_answer)
         if ALWAYS_ANSWER:
             print("➡️ route=llm_fallback_from_product")
             ans = compose_contextual_answer("", user_question, hist, lang=lang)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
-        # 3) Cuối cùng mới rơi về OOS
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
         print("➡️ route=oos_hint")
         return t(lang, "oos", url=url), []
@@ -1595,6 +1598,7 @@ def answer_with_rag(user_id, user_question):
         ans = compose_contextual_answer("", user_question, hist, lang=lang)
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
     return t(lang, "fallback"), []
+
 
 
 # ========= WEBHOOK =========
