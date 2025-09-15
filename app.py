@@ -12,18 +12,20 @@ from typing import Optional
 from ingest_products import fetch_all_products, build_docs, dedup_docs, save_faiss
 # --- Flask & CORS ---
 app = Flask(__name__)
+cors_opts = {
+    "origins": [
+        "https://aloha.id.vn",
+        "https://www.aloha.id.vn",
+        "https://9mn9fa-6p.myshopify.com",
+    ],
+    "supports_credentials": True,
+    "allow_headers": ["Content-Type", "Authorization", "X-Admin-Token"],
+    "methods": ["GET", "POST", "OPTIONS"],
+}
+
 CORS(app, resources={
-    r"/api/*": {...},
-    r"/admin/*": {  # thêm block này nếu cần gọi admin từ web
-        "origins": [
-            "https://aloha.id.vn",
-            "https://www.aloha.id.vn",
-            "https://9mn9fa-6p.myshopify.com",
-        ],
-        "supports_credentials": True,
-        "allow_headers": ["Content-Type", "Authorization", "X-Admin-Token"],
-        "methods": ["GET", "POST", "OPTIONS"],
-    }
+    r"/api/*": cors_opts,
+    r"/admin/*": cors_opts,   # chỉ cần block này nếu bạn muốn gọi admin từ browser
 })
 
 
