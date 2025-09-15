@@ -22,7 +22,7 @@ CORS(app, resources={
             "https://9mn9fa-6p.myshopify.com",
         ],
         "supports_credentials": True,
-        "allow_headers": ["Content-Type", "Authorization"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Admin-Token"],
         "methods": ["GET", "POST", "OPTIONS"],
     }
 })
@@ -495,25 +495,34 @@ def _reload_vectors():
         print("❌ reload vectors:", repr(e))
         return False
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+# --- Admin auth (strip + đa kênh + tắt tạm thời) ---
+ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()
+DISABLE_ADMIN_AUTH = os.getenv("DISABLE_ADMIN_AUTH", "false").lower() == "true"
+
+def _admin_ok(req):
+    if DISABLE_ADMIN_AUTH:
+        return True
+    hdr = (req.headers.get("X-Admin-Token") or "").strip()
+    qp  = (req.args.get("token") or "").strip()  # cho phép ?token=...
+    token = hdr or qp
+    return (not ADMIN_TOKEN) or (token == ADMIN_TOKEN)
 
 @app.post("/admin/reload_vectors")
 def admin_reload_vectors():
-    if ADMIN_TOKEN and request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+    if not _admin_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     ok = _reload_vectors()
     return jsonify({"ok": ok})
+
 @app.post("/admin/rebuild_vectors_now")
 def admin_rebuild_vectors_now():
-    if ADMIN_TOKEN and request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+    if not _admin_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     try:
         t0 = time.time()
         products = fetch_all_products()
         docs = dedup_docs(build_docs(products))
-
-        os.makedirs(VECTOR_DIR, exist_ok=True)  # <<< thêm dòng này
-
+        os.makedirs(VECTOR_DIR, exist_ok=True)
         save_faiss(
             docs,
             os.path.join(VECTOR_DIR, "products.index"),
@@ -522,6 +531,7 @@ def admin_rebuild_vectors_now():
         return jsonify({"ok": True, "chunks": len(docs), "t": round(time.time() - t0, 1)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
