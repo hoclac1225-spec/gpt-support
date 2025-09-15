@@ -10,6 +10,7 @@ from openai import OpenAI
 import hmac, hashlib, base64
 from typing import Optional
 from ingest_products import fetch_all_products, build_docs, dedup_docs, save_faiss
+from threading import Thread
 
 
 # --- Flask & CORS ---
@@ -471,16 +472,16 @@ def _safe_read_index(prefix):
             print(f"⚠️ Missing index/meta for '{prefix}'")
             return None, None
         idx  = faiss.read_index(idx_path)
-        meta = json.load(open(meta_path, encoding="utf-8"))
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
 
-        # --- Áp canonical domain cho mọi URL trong meta ---
         meta = _apply_canonical_urls(meta)
-
         print(f"✅ {prefix} loaded: {len(meta)} chunks")
         return idx, meta
     except Exception as e:
         print(f"❌ Load index '{prefix}':", repr(e))
         return None, None
+
     
 IDX_PROD, META_PROD = _safe_read_index("products")
 IDX_POL,  META_POL  = _safe_read_index("policies")
@@ -511,33 +512,86 @@ def _admin_ok(req):
     token = hdr or qp
     return (not ADMIN_TOKEN) or (token == ADMIN_TOKEN)
 
+# --- Admin auth vẫn dùng helper có sẵn ---
+# def _admin_ok(req): ... (giữ nguyên)
+
+# ================== RELOAD ==================
 @app.post("/admin/reload_vectors")
 def admin_reload_vectors():
     if not _admin_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     ok = _reload_vectors()
-    return jsonify({"ok": ok})
+    return jsonify({
+        "ok": ok,
+        "products_chunks": len(META_PROD) if META_PROD else 0,
+        "policies_chunks": len(META_POL) if META_POL else 0
+    })
 
+# ================== REBUILD (sync) ==================
 @app.post("/admin/rebuild_vectors_now")
 def admin_rebuild_vectors_now():
     if not _admin_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     try:
         t0 = time.time()
+
+        # (tuỳ chọn) clear file cũ
+        clear = (request.args.get("clear", "0") == "1")
+
         products = fetch_all_products()
         docs = dedup_docs(build_docs(products))
+
         os.makedirs(VECTOR_DIR, exist_ok=True)
-        save_faiss(
+        if clear:
+            for fn in ("products.index", "products.meta.json"):
+                fp = os.path.join(VECTOR_DIR, fn)
+                try:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except Exception:
+                    pass
+
+        vectors_saved = save_faiss(
             docs,
             os.path.join(VECTOR_DIR, "products.index"),
             os.path.join(VECTOR_DIR, "products.meta.json"),
-        )
-        return jsonify({"ok": True, "chunks": len(docs), "t": round(time.time() - t0, 1)})
+        ) or len(docs)
+
+        _reload_vectors()
+
+        return jsonify({
+            "ok": True,
+            "chunks": len(docs),
+            "vectors_saved": int(vectors_saved),
+            "t": round(time.time() - t0, 1)
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# ================== REBUILD (async, tránh timeout) ==================
 
+@app.post("/admin/rebuild_vectors_async")
+def admin_rebuild_vectors_async():
+    if not _admin_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
+    def job():
+        try:
+            products = fetch_all_products()
+            docs = dedup_docs(build_docs(products))
+            os.makedirs(VECTOR_DIR, exist_ok=True)
+            save_faiss(
+                docs,
+                os.path.join(VECTOR_DIR, "products.index"),
+                os.path.join(VECTOR_DIR, "products.meta.json"),
+            )
+            _reload_vectors()
+            print(f"[rebuild_async] done, saved={len(docs)}")
+        except Exception as e:
+            print("[rebuild_async] error:", repr(e))
+
+    Thread(target=job, daemon=True).start()
+    return jsonify({"ok": True, "status": "started"})
 
 def _embed_query(q: str) -> Optional[np.ndarray]:
     try:
