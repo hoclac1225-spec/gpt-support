@@ -8,4 +8,6 @@ numpy
 faiss-cpu
 APScheduler==3.10.4
 langdetect
+psutil
+
 
