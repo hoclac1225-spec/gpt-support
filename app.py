@@ -11,21 +11,26 @@ import hmac, hashlib
 from typing import Optional
 from ingest_products import fetch_all_products, build_docs, dedup_docs, save_faiss
 # --- Flask & CORS ---
+# --- Flask & CORS ---
+# --- Flask & CORS ---
 app = Flask(__name__)
+
 cors_opts = {
     "origins": [
-        "https://aloha.id.vn",
-        "https://www.aloha.id.vn",
+        r"^https://([a-z0-9-]+\.)?aloha\.id\.vn$",   # *.aloha.id.vn
         "https://9mn9fa-6p.myshopify.com",
     ],
     "supports_credentials": True,
     "allow_headers": ["Content-Type", "Authorization", "X-Admin-Token"],
     "methods": ["GET", "POST", "OPTIONS"],
+    "max_age": 3600,
 }
 
+# LƯU Ý: dùng /api/.* thay vì /api/*
+
 CORS(app, resources={
-    r"/api/*": cors_opts,
-    r"/admin/*": cors_opts,   # chỉ cần block này nếu bạn muốn gọi admin từ browser
+    r"/api/.*": cors_opts,
+    r"/admin/.*": cors_opts,
 })
 
 
