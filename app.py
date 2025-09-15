@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 import unicodedata
 import os, json, time, re, requests, numpy as np, faiss, threading, random
@@ -87,8 +88,8 @@ def _score_gate(q: str, hits: list, best: float) -> bool:
 
 
 # --- Title overlap config (đặt ở cấp module, sau load_dotenv) ---
-TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "2"))
-TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.25"))
+TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "3"))
+TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.30"))
 TITLE_MAX_CHECK = int(os.getenv("TITLE_MAX_CHECK", "5"))
 
 def _has_title_overlap(
@@ -186,7 +187,8 @@ SHOPIFY_SHOP = os.getenv("SHOPIFY_STORE", "")  # domain *.myshopify.com (tham ch
 # Link shop mặc định (fallback)
 SHOP_URL         = os.getenv("SHOP_URL", "https://shop.aloha.id.vn/zh")
 # Đa ngôn ngữ
-SUPPORTED_LANGS  = [s.strip() for s in os.getenv("SUPPORTED_LANGS", "vi,en,zh,th,id").split(",")]
+SUPPORTED_LANGS  = [s.strip() for s in os.getenv("SUPPORTED_LANGS", "vi,en,zh,th,id,ko,ja").split(",")]
+
 DEFAULT_LANG     = os.getenv("DEFAULT_LANG", "vi")
 SHOP_URL_MAP = {
     "vi": os.getenv("SHOP_URL_VI", SHOP_URL),
@@ -194,7 +196,10 @@ SHOP_URL_MAP = {
     "zh": os.getenv("SHOP_URL_ZH", SHOP_URL),
     "th": os.getenv("SHOP_URL_TH", SHOP_URL),
     "id": os.getenv("SHOP_URL_ID", SHOP_URL),
+    "ko": os.getenv("SHOP_URL_KO", SHOP_URL),
+    "ja": os.getenv("SHOP_URL_JA", SHOP_URL),
 }
+
 # --- Always-answer & shop identity ---
 ALWAYS_ANSWER = os.getenv("ALWAYS_ANSWER", "true").lower() == "true"
 SHOP_NAME = os.getenv("SHOP_NAME", "Aloha")
@@ -216,7 +221,7 @@ REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "true").lower() == "true"
 EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 
 # Lọc & ngưỡng điểm
-SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.28"))
+SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.34"))
 STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
 
 # ...
@@ -670,6 +675,13 @@ def detect_lang(text: str) -> str:
         return "zh" if "zh" in SUPPORTED_LANGS else DEFAULT_LANG
     if re.search(r"[\u0E00-\u0E7F]", txt):  # Thai
         return "th" if "th" in SUPPORTED_LANGS else DEFAULT_LANG
+        # Korean Hangul
+    if re.search(r"[\uac00-\ud7af]", txt):  # Hangul syllables
+        return "ko" if "ko" in SUPPORTED_LANGS else DEFAULT_LANG
+    # Japanese (Hiragana + Katakana)
+    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", txt):
+        return "ja" if "ja" in SUPPORTED_LANGS else DEFAULT_LANG
+
     if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộơóờởỡợíìỉĩịúùủũụưứừửữựýỳỷỹỵ]", txt, flags=re.I):
         return "vi" if "vi" in SUPPORTED_LANGS else DEFAULT_LANG
     if re.search(r"\b(yang|dan|tidak|saja|terima|kasih)\b", txt.lower()):
@@ -759,6 +771,37 @@ LANG_STRINGS = {
         "btn_view": "Lihat produk",
         "quick_view": "Lihat cepat:",
     },
+        "ko": {
+        "greet": "안녕하세요 👋 무엇을 도와드릴까요? 🙂",
+        "browse": "스토어를 둘러보세요 🛍️ 👉 {url}",
+        "oos": "죄송해요 🙏 해당 상품은 현재 **품절**입니다. 비슷한 상품을 여기서 확인해 보세요 👉 {url} ✨",
+        "fallback": "정보가 조금 부족해요 🤔. 원하는 스타일/재질/사이즈를 알려주시면 더 정확히 추천해 드릴게요 ✨",
+        "suggest_hdr": "이런 옵션을 추천드려요",
+        "product_pts": "슬림/스포티 중 어떤 스타일이 좋으세요? 색상/사이즈도 골라드릴게요.",
+        "highlights": "{title} 주요 포인트",
+        "policy_hint": "스토어 정책:",
+        "smalltalk_hi": "안녕하세요 👋 잘 지내고 있어요 😄",
+        "smalltalk_askback": "오늘 하루는 어떠세요?",
+        "new_hdr": "신상품 ✨",
+        "btn_view": "상품 보기",
+        "quick_view": "빠른 보기:",
+    },
+    "ja": {
+        "greet": "こんにちは 👋 何をお手伝いできますか？ 🙂",
+        "browse": "ストアをご覧ください 🛍️ 👉 {url}",
+        "oos": "すみません 🙏 その商品は現在**在庫切れ**です。こちらから似た商品をご覧ください 👉 {url} ✨",
+        "fallback": "もう少し情報が必要です 🤔。スタイル/素材/サイズを教えていただければ、より正確にご提案します ✨",
+        "suggest_hdr": "こちらのオプションがおすすめです",
+        "product_pts": "スリム or スポーティ、どちらが好みですか？色・サイズの絞り込みもできます。",
+        "highlights": "{title} のポイント",
+        "policy_hint": "ストアポリシー：",
+        "smalltalk_hi": "こんにちは 👋 元気です 😄",
+        "smalltalk_askback": "今日はどんな一日ですか？",
+        "new_hdr": "新着アイテム ✨",
+        "btn_view": "商品を見る",
+        "quick_view": "クイックビュー：",
+    },
+
 }
 
 
@@ -824,6 +867,19 @@ SMALLTALK_PATTERNS = {
         r"(terima\s*kasih|terimakasih|trimakasih|makasih|makasi|thanks?|thank you|thx|ty)",
         r"(wkwk+|wk+|haha+|hehe+|:d)|[😂🤣😆]",
     ],
+        "ko": [
+        r"(안녕|안녕하세요|하이|헬로)",
+        r"(요즘 어때|잘 지내|기분 어때)",
+        r"(고마워|감사|땡큐|thanks?|thank you|thx|ty)",
+        r"(ㅋㅋ+|ㅎㅎ+|하하+)|[😂🤣😆]",
+    ],
+    "ja": [
+        r"(こんにちは|こんちは|もしもし|やあ|ハロー)",
+        r"(元気ですか|調子どう|最近どう)",
+        r"(ありがとう|有難う|サンキュー|thanks?|thank you|thx|ty)",
+        r"(笑|ｗｗ+|はは+)|[😂🤣😆]",
+    ],
+
 }
 
 NEW_ITEMS_PATTERNS = {
@@ -1381,10 +1437,6 @@ def answer_with_rag(user_id, user_question):
     # nếu filter bị rỗng nhưng điểm đã đạt ngưỡng → giữ nguyên prod_hits
     if not filtered_hits and ok_by_score:
         filtered_hits = prod_hits
-
-
-    if intent == "other" and (filtered_hits or title_ok):
-        intent = "product"
 
     if title_ok and not filtered_hits:
         filtered_hits = prod_hits
