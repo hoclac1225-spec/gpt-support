@@ -498,6 +498,50 @@ def _reload_vectors():
     except Exception as e:
         print("❌ reload vectors:", repr(e))
         return False
+# ==== Diagnostics: sizes & memory ====
+import psutil, shutil
+
+def _file_size_mb(path):
+    try:
+        return round(os.path.getsize(path) / 1024 / 1024, 2)
+    except Exception:
+        return 0.0
+
+@app.route("/debug/rag_status")
+def rag_status():
+    products_index_path = os.path.join(VECTOR_DIR, "products.index")
+    policies_index_path = os.path.join(VECTOR_DIR, "policies.index")
+    return jsonify({
+        "vector_dir": os.path.abspath(VECTOR_DIR),
+        "products_index": bool(IDX_PROD),
+        "products_chunks": len(META_PROD) if META_PROD else 0,
+        "products_index_size_mb": _file_size_mb(products_index_path),
+        "policies_index": bool(IDX_POL),
+        "policies_chunks": len(META_POL) if META_POL else 0,
+        "policies_index_size_mb": _file_size_mb(policies_index_path),
+        "sessions": len(SESS),
+    })
+
+@app.route("/debug/mem_status")
+def mem_status():
+    p = psutil.Process(os.getpid())
+    rss_mb = p.memory_info().rss / 1024 / 1024
+    vms_mb = p.memory_info().vms / 1024 / 1024
+    return jsonify({
+        "pid": p.pid,
+        "rss_mb": round(rss_mb, 2),
+        "vms_mb": round(vms_mb, 2),
+    })
+
+@app.route("/debug/disk_status")
+def disk_status():
+    total, used, free = shutil.disk_usage("/")
+    to_mb = lambda x: round(x / 1024 / 1024, 2)
+    return jsonify({
+        "disk_total_mb": to_mb(total),
+        "disk_used_mb": to_mb(used),
+        "disk_free_mb": to_mb(free),
+    })
 
 # --- Admin auth (strip + đa kênh + tắt tạm thời) ---
 ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()
@@ -1685,8 +1729,8 @@ def data_deletion():
     """, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 # ========= Debug & Health =========
-@app.route("/debug/rag_status")
-def rag_status():
+@app.route("/debug/rag_status_simple")
+def rag_status_simple():
     return jsonify({
         "vector_dir": os.path.abspath(VECTOR_DIR),
         "products_index": bool(IDX_PROD),
