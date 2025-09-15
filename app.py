@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from openai import OpenAI
-import hmac, hashlib, base64
+import hmac, hashlib
 from typing import Optional
 from ingest_products import fetch_all_products, build_docs, dedup_docs, save_faiss
 # --- Flask & CORS ---
@@ -31,6 +31,49 @@ CORS(app, resources={
 
 # Load .env TRƯỚC khi đọc os.getenv
 load_dotenv()
+
+from langdetect import detect, DetectorFactory
+DetectorFactory.seed = 0  # cố định seed để kết quả ổn định
+
+# --- Ngôn ngữ hỗ trợ ---
+_supported = os.getenv("SUPPORTED_LANGS", "vi,en,zh,th,id,ko,ja")
+SUPPORTED_LANGS = [s.strip() for s in _supported.split(",") if s.strip()]
+
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "vi")
+if DEFAULT_LANG not in SUPPORTED_LANGS:
+    SUPPORTED_LANGS.append(DEFAULT_LANG)
+
+
+def detect_lang(text: str) -> str:
+    """
+    Tự động nhận diện ngôn ngữ đầu vào.
+    Nếu không chắc chắn -> fallback về DEFAULT_LANG.
+    """
+    txt = (text or "").strip()
+    if not txt:
+        return DEFAULT_LANG
+    try:
+        lang = detect(txt)
+        # Chuẩn hóa một số mã trả về khác nhau
+        lang = {"zh-cn": "zh", "zh-tw": "zh", "pt-br": "pt"}.get(lang, lang)
+        return lang if lang in SUPPORTED_LANGS else DEFAULT_LANG
+    except Exception:
+        # Fallback regex nhẹ cho CJK/TH/KO/JA/VI/ID
+        if re.search(r"[\u4e00-\u9fff]", txt):  
+            return "zh" if "zh" in SUPPORTED_LANGS else DEFAULT_LANG
+        if re.search(r"[\u0E00-\u0E7F]", txt):  
+            return "th" if "th" in SUPPORTED_LANGS else DEFAULT_LANG
+        if re.search(r"[\uac00-\ud7af]", txt):  
+            return "ko" if "ko" in SUPPORTED_LANGS else DEFAULT_LANG
+        if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", txt):  
+            return "ja" if "ja" in SUPPORTED_LANGS else DEFAULT_LANG
+        if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệ"
+                     r"óòỏõọốồổỗộơóờởỡợíìỉĩịúùủũụưứừửữự"
+                     r"ýỳỷỹỵ]", txt, flags=re.I):
+            return "vi" if "vi" in SUPPORTED_LANGS else DEFAULT_LANG
+        if re.search(r"\b(yang|dan|tidak|saja|terima|kasih)\b", txt.lower()):
+            return "id" if "id" in SUPPORTED_LANGS else DEFAULT_LANG
+        return "en" if "en" in SUPPORTED_LANGS else DEFAULT_LANG
 
 
 # --- text normalize helpers (có & không dấu)
@@ -188,10 +231,7 @@ VECTOR_DIR       = os.getenv("VECTOR_DIR", "./vectors")
 SHOPIFY_SHOP = os.getenv("SHOPIFY_STORE", "")  # domain *.myshopify.com (tham chiếu)
 # Link shop mặc định (fallback)
 SHOP_URL         = os.getenv("SHOP_URL", "https://shop.aloha.id.vn/zh")
-# Đa ngôn ngữ
-SUPPORTED_LANGS  = [s.strip() for s in os.getenv("SUPPORTED_LANGS", "vi,en,zh,th,id,ko,ja").split(",")]
 
-DEFAULT_LANG     = os.getenv("DEFAULT_LANG", "vi")
 SHOP_URL_MAP = {
     "vi": os.getenv("SHOP_URL_VI", SHOP_URL),
     "en": os.getenv("SHOP_URL_EN", SHOP_URL),
@@ -281,13 +321,21 @@ def _remember(user_id, role, text):
 
 # ========= OPENAI WRAPPER =========
 def _to_chat_messages(messages):
-    """Chuyển format responses -> chat.completions để fallback."""
+    """Chuyển về định dạng chat.completions; chấp nhận cả content=str hoặc content=[{type,text}]."""
     chat_msgs = []
-    ALLOWED = {"input_text", "output_text", "text"}  # <-- thêm output_text
+    ALLOWED = {"input_text", "output_text", "text"}
     for m in messages:
         role = m.get("role", "user")
-        parts = m.get("content", [])
-        text = "\n".join([p.get("text","") for p in parts if p.get("type") in ALLOWED]).strip()
+        content = m.get("content", "")
+        if isinstance(content, str):
+            text = content.strip()
+        else:
+            # content là list các part
+            parts = []
+            for p in content or []:
+                if isinstance(p, dict) and p.get("type") in ALLOWED:
+                    parts.append(p.get("text", ""))
+            text = "\n".join(parts).strip()
         chat_msgs.append({"role": role, "content": text})
     return chat_msgs
 
@@ -354,7 +402,8 @@ def rephrase_casual(text: str, intent="generic", temperature=0.7, lang: str = No
     try:
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
         msgs = [
-            {"role":"system","content":f"Bạn là trợ lý bán hàng, viết {lang or 'vi'} tự nhiên, thân thiện, ngắn gọn; thêm 1–2 emoji phù hợp (không lạm dụng). Giữ nguyên dữ kiện/giá, không bịa."},
+            {"role":"system","content":f"Bạn là trợ lý bán hàng, **luôn trả lời bằng ngôn ngữ: {lang or 'vi'}**, văn phong thân thiện, ngắn gọn, 1–2 emoji."},
+
             {"role":"user","content": f"Viết lại đoạn sau bằng {lang or 'vi'} theo giọng thân thiện, kết thúc bằng 1 câu chốt hành động.\n---\n{text}\n---\n{em(intent,2)}"}
         ]
         r = requests.post(
@@ -536,7 +585,7 @@ def admin_rebuild_vectors_now():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     try:
         t0 = time.time()
-        embed_batch = int(request.args.get("batch", os.getenv("EMBED_BATCH", "64")))
+      
         clear = (request.args.get("clear", "0") == "1")
 
         products = fetch_all_products()
@@ -724,26 +773,6 @@ def is_greeting(text: str) -> bool:
     return any(w in t for w in GREETS) and len(t) <= 40
 
 # ——— Ngôn ngữ: detect & câu chữ
-def detect_lang(text: str) -> str:
-    txt = (text or "").strip()
-    if not txt: return DEFAULT_LANG
-    if re.search(r"[\u4e00-\u9fff]", txt):  # CJK
-        return "zh" if "zh" in SUPPORTED_LANGS else DEFAULT_LANG
-    if re.search(r"[\u0E00-\u0E7F]", txt):  # Thai
-        return "th" if "th" in SUPPORTED_LANGS else DEFAULT_LANG
-        # Korean Hangul
-    if re.search(r"[\uac00-\ud7af]", txt):  # Hangul syllables
-        return "ko" if "ko" in SUPPORTED_LANGS else DEFAULT_LANG
-    # Japanese (Hiragana + Katakana)
-    if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", txt):
-        return "ja" if "ja" in SUPPORTED_LANGS else DEFAULT_LANG
-
-    if re.search(r"[ăâêôơưđáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệóòỏõọốồổỗộơóờởỡợíìỉĩịúùủũụưứừửữựýỳỷỹỵ]", txt, flags=re.I):
-        return "vi" if "vi" in SUPPORTED_LANGS else DEFAULT_LANG
-    if re.search(r"\b(yang|dan|tidak|saja|terima|kasih)\b", txt.lower()):
-        return "id" if "id" in SUPPORTED_LANGS else DEFAULT_LANG
-    return "en" if "en" in SUPPORTED_LANGS else DEFAULT_LANG
-
 
 # ====== MULTI-LANG PATTERNS (smalltalk & new arrivals) ======
 # Mỗi ngôn ngữ là 1 list regex. Có thể bổ sung dần mà không đụng chỗ khác.
@@ -859,6 +888,14 @@ LANG_STRINGS = {
     },
 
 }
+LANG_STRINGS["vi"]["price_hint"] = "Giá tham khảo: {price}"
+LANG_STRINGS["en"]["price_hint"] = "Reference price: {price}"
+LANG_STRINGS["zh"]["price_hint"] = "参考价格：{price}"
+LANG_STRINGS["th"]["price_hint"] = "ราคาโดยอ้างอิง: {price}"
+LANG_STRINGS["id"]["price_hint"] = "Harga referensi: {price}"
+LANG_STRINGS["ko"]["price_hint"] = "참고 가격: {price}"
+LANG_STRINGS["ja"]["price_hint"] = "参考価格：{price}"
+
 
 
 def t(lang: str, key: str, **kw) -> str:
@@ -1398,8 +1435,7 @@ def compose_product_info(hits, lang: str = "vi"):
     stock      = _stock_line(d)
 
     price_val  = _price_value(d)
-    price_line = f"Giá tham khảo: {_fmt_price(price_val, currency)}" if price_val is not None else ""
-
+    price_line = t(lang, "price_hint", price=_fmt_price(price_val, currency)) if price_val is not None else ""
     bullets = _extract_features_from_text(d.get("text",""))
     body    = "\n".join(bullets) if bullets else "• Thiết kế tối giản, dễ phối đồ\n• Chất liệu thoáng, dễ vệ sinh"
 
@@ -1439,23 +1475,29 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
     lines = []
     title = main.get("title") or "Sản phẩm"
     lines.append(f"Vâng ạ, **{title}** đang được shop bán với **giá công khai: {main_price_str}**.")
+
+    # Gợi ý cùng dòng (chỉ thêm khi có giá hợp lệ)
     sug = []
     if high:
-        hp = _fmt_price(_price_value(high), currency)
-        sug.append(f"• **Cùng dòng – giá cao nhất:** {high.get('title','SP')} — {hp}")
+        hv = _fmt_price(_price_value(high), currency)
+        if hv:
+            sug.append(f"• **Cùng dòng – giá cao nhất:** {high.get('title','SP')} — {hv}")
     if low:
-        lp = _fmt_price(_price_value(low), currency)
-        sug.append(f"• **Cùng dòng – giá thấp nhất:** {low.get('title','SP')} — {lp}")
+        lv = _fmt_price(_price_value(low), currency)
+        if lv:
+            sug.append(f"• **Cùng dòng – giá thấp nhất:** {low.get('title','SP')} — {lv}")
 
     if sug:
         lines.append("Bạn cũng có thể tham khảo thêm:")
         lines += sug
+
     lines.append(t(lang, "product_pts"))
     raw = "\n".join(lines)
 
-    # Thêm SP chính vào button đầu tiên
+    # Nút xem nhanh (SP chính + 1–2 gợi ý nếu có)
     btns = [main] + [x for x in (high, low) if x]
     return rephrase_casual(raw, intent="product", lang=lang), btns[:2]
+
 def answer_with_rag(user_id, user_question):
     s = _get_sess(user_id)
     hist = s["hist"]
