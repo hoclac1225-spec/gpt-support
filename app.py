@@ -10,13 +10,11 @@ from openai import OpenAI
 import hmac, hashlib, base64
 from typing import Optional
 from ingest_products import fetch_all_products, build_docs, dedup_docs, save_faiss
-from threading import Thread
-
-
 # --- Flask & CORS ---
 app = Flask(__name__)
 CORS(app, resources={
-    r"/api/*": {
+    r"/api/*": {...},
+    r"/admin/*": {  # thêm block này nếu cần gọi admin từ web
         "origins": [
             "https://aloha.id.vn",
             "https://www.aloha.id.vn",
@@ -27,6 +25,7 @@ CORS(app, resources={
         "methods": ["GET", "POST", "OPTIONS"],
     }
 })
+
 
 # Load .env TRƯỚC khi đọc os.getenv
 load_dotenv()
@@ -516,6 +515,7 @@ def _admin_ok(req):
 # def _admin_ok(req): ... (giữ nguyên)
 
 # ================== RELOAD ==================
+# ================== RELOAD ==================
 @app.post("/admin/reload_vectors")
 def admin_reload_vectors():
     if not _admin_ok(request):
@@ -534,8 +534,7 @@ def admin_rebuild_vectors_now():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
     try:
         t0 = time.time()
-
-        # (tuỳ chọn) clear file cũ
+        embed_batch = int(request.args.get("batch", os.getenv("EMBED_BATCH", "64")))
         clear = (request.args.get("clear", "0") == "1")
 
         products = fetch_all_products()
@@ -546,8 +545,7 @@ def admin_rebuild_vectors_now():
             for fn in ("products.index", "products.meta.json"):
                 fp = os.path.join(VECTOR_DIR, fn)
                 try:
-                    if os.path.exists(fp):
-                        os.remove(fp)
+                    if os.path.exists(fp): os.remove(fp)
                 except Exception:
                     pass
 
@@ -558,7 +556,6 @@ def admin_rebuild_vectors_now():
         ) or len(docs)
 
         _reload_vectors()
-
         return jsonify({
             "ok": True,
             "chunks": len(docs),
@@ -568,7 +565,8 @@ def admin_rebuild_vectors_now():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ================== REBUILD (async, tránh timeout) ==================
+# ================== REBUILD (async) ==================
+from threading import Thread
 
 @app.post("/admin/rebuild_vectors_async")
 def admin_rebuild_vectors_async():
@@ -592,6 +590,7 @@ def admin_rebuild_vectors_async():
 
     Thread(target=job, daemon=True).start()
     return jsonify({"ok": True, "status": "started"})
+
 
 def _embed_query(q: str) -> Optional[np.ndarray]:
     try:
@@ -637,24 +636,25 @@ def retrieve_context(question, topk=6):
         return ""
 
     v = _embed_query(question)
-    if v is None:  # >>> thêm dòng an toàn
+    if v is None:
         return ""
 
     ctx = []
     if IDX_PROD is not None:
         try:
             _, Ip = IDX_PROD.search(v, topk)
-            ctx += [META_PROD[i]["text"] for i in Ip[0] if i >= 0]
+            ctx += [META_PROD[i]["text"] for i in Ip[0] if 0 <= i < len(META_PROD)]
         except Exception as e:
             print("⚠️ search products:", repr(e))
     if IDX_POL is not None:
         try:
             _, Ik = IDX_POL.search(v, topk)
-            ctx += [META_POL[i]["text"] for i in Ik[0] if i >= 0]
+            ctx += [META_POL[i]["text"] for i in Ik[0] if 0 <= i < len(META_POL)]
         except Exception as e:
             print("⚠️ search policies:", repr(e))
     print("🧠 ctx pieces:", len(ctx))
     return "\n\n".join(ctx[:topk]) if ctx else ""
+
 def _parse_ts(s):
     try:
         s = (s or "").replace("Z", "").replace("T", " ")
