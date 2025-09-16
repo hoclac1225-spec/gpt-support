@@ -93,6 +93,53 @@ def _score_gate(q: str, hits: list, best: float) -> bool:
 TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "3"))
 TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.30"))
 TITLE_MAX_CHECK = int(os.getenv("TITLE_MAX_CHECK", "5"))
+# ==== Title normalization & similarity (đa ngôn ngữ) ====
+# bỏ emoji/kí hiệu Surrogate Plane (không ảnh hưởng chữ VN/CJK)
+EMOJI_RE = re.compile(r"[\U00010000-\U0010FFFF]")
+
+def _strip_emoji_symbols(s: str) -> str:
+    return EMOJI_RE.sub(" ", s or "")
+
+def _norm_title(s: str) -> str:
+    # chuẩn hoá width (｜ -> |), hạ kí tự đặc biệt, giữ lại chữ số + latin + CJK
+    s = unicodedata.normalize("NFKC", s or "")
+    s = s.replace("｜", " ").replace("|", " ")
+    s = _strip_emoji_symbols(s)
+    return _normalize_text(s)
+
+def _cjk_cover(qn: str, tn: str) -> float:
+    # tỉ lệ phủ bigram ký tự (dùng cho CJK/tiêu đề không có khoảng trắng)
+    qg = _char_ngrams(qn, 2)
+    tg = _char_ngrams(tn, 2)
+    if not qg or not tg:
+        return 0.0
+    return len(qg & tg) / max(1, len(qg))
+
+def _title_similarity(q: str, title: str) -> float:
+    qn = _norm_title(q)
+    tn = _norm_title(title)
+    # nếu có CJK → dùng cover bigram; ngược lại dùng trùng từ
+    if _any_cjk(qn) or _any_cjk(tn):
+        return _cjk_cover(qn, tn)          # 0.0 – 1.0
+    qwords = [w for w in qn.split() if len(w) > 1]
+    twords = set(tn.split())
+    if not qwords or not twords:
+        return 0.0
+    matched = sum(1 for w in qwords if w in twords)
+    return matched / len(qwords)            # 0.0 – 1.0
+
+def _rerank_by_title(q: str, hits: list, scores: list) -> list:
+    """Trộn score vector + độ giống tiêu đề để ưu tiên đúng sản phẩm."""
+    out = []
+    for i, d in enumerate(hits):
+        dd = dict(d)  # không làm hỏng cấu trúc cũ
+        dd["_title_sim"] = _title_similarity(q, d.get("title", ""))
+        dd["score"] = float(scores[i]) if i < len(scores) else 0.0
+        out.append(dd)
+    # ưu tiên theo độ giống tiêu đề, sau đó tới điểm vector
+    out.sort(key=lambda x: (x.get("_title_sim", 0.0), x.get("score", 0.0)), reverse=True)
+    return out
+
 
 def _has_title_overlap(
     q: str,
@@ -1515,6 +1562,10 @@ def answer_with_rag(user_id, user_question):
 
     # ——— PRODUCT SEARCH ———
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
+    # NEW: rerank theo tiêu đề để đẩy đúng sản phẩm lên đầu
+    prod_hits = _rerank_by_title(user_question, prod_hits, prod_scores)
+    prod_scores = [h.get("score", 0.0) for h in prod_hits]
+
     best = max(prod_scores or [0.0])
 
     ok_by_score = _score_gate(user_question, prod_hits, best)
