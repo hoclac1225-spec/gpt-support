@@ -515,9 +515,11 @@ def rag_status():
         "vector_dir": os.path.abspath(VECTOR_DIR),
         "products_index": bool(IDX_PROD),
         "products_chunks": len(META_PROD) if META_PROD else 0,
+        "products_index_ntotal": int(getattr(IDX_PROD, "ntotal", 0)) if IDX_PROD else 0,
         "products_index_size_mb": _file_size_mb(products_index_path),
         "policies_index": bool(IDX_POL),
         "policies_chunks": len(META_POL) if META_POL else 0,
+        "policies_index_ntotal": int(getattr(IDX_POL, "ntotal", 0)) if IDX_POL else 0,
         "policies_index_size_mb": _file_size_mb(policies_index_path),
         "sessions": len(SESS),
     })
@@ -573,30 +575,41 @@ def admin_rebuild_vectors_now():
         docs = dedup_docs(build_docs(products))
         os.makedirs(VECTOR_DIR, exist_ok=True)
 
-        # đường dẫn
         idx_path  = os.path.join(VECTOR_DIR, "products.index")
         meta_path = os.path.join(VECTOR_DIR, "products.meta.json")
-        # ghi tạm để swap atomically (tránh đọc phải file chưa ghi xong)
         idx_tmp   = idx_path  + ".tmp"
         meta_tmp  = meta_path + ".tmp"
 
-        # build & ghi ra file tạm
+        # Ghi file tạm
         save_faiss(docs, idx_tmp, meta_tmp)
 
-        # atomic swap
+        # 👉 ĐẾM SỐ “THỰC SỰ” ĐÃ GHI
+        try:
+            saved_ntotal = int(getattr(faiss.read_index(idx_tmp), "ntotal", 0))
+        except Exception:
+            saved_ntotal = 0
+        try:
+            saved_meta = len(json.load(open(meta_tmp, encoding="utf-8")))
+        except Exception:
+            saved_meta = 0
+
+        # Atomic swap
         os.replace(idx_tmp,  idx_path)
         os.replace(meta_tmp, meta_path)
 
-        # nạp index mới vào RAM ngay
+        # Reload vào RAM
         ok = _reload_vectors()
 
-        return jsonify({"ok": ok, "chunks": len(docs), "t": round(time.time() - t0, 1)})
+        return jsonify({
+            "ok": ok,
+            "docs_after_dedup": len(docs),        # số doc sau build+dedup
+            "saved_to_index": saved_ntotal,       # số vector thực đã ghi
+            "saved_meta": saved_meta,             # số item trong meta (nên = saved_to_index)
+            "skipped": max(0, len(docs) - saved_ntotal),
+            "t": round(time.time() - t0, 1)
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-
-
-
-
 
 def _embed_query(q: str) -> Optional[np.ndarray]:
     try:
