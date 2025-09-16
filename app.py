@@ -1594,17 +1594,13 @@ def answer_with_rag(user_id, user_question):
 
     # ——— PRODUCT SEARCH ———
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
-    # Rerank theo tiêu đề để ưu tiên đúng sản phẩm
+    # rerank theo độ giống tiêu đề
     prod_hits = _rerank_by_title(user_question, prod_hits, prod_scores)
     prod_scores = [h.get("score", 0.0) for h in prod_hits]
-
     best = max(prod_scores or [0.0])
-    ok_by_score = _score_gate(user_question, prod_hits, best)
 
-    # STRICT MATCH: chỉ giữ các hit có token/cụm từ khớp trong title/tags/type/variant
+    # CHỈ dùng lọc keyword/title – KHÔNG “cứu” theo score
     filtered_hits = filter_hits_by_query(prod_hits, user_question, lang=lang) if STRICT_MATCH else prod_hits
-
-    # CHỈ log tham khảo (không dùng để “bơm” lại sản phẩm)
     title_ok = _has_title_overlap(user_question, prod_hits)
 
     print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
@@ -1617,40 +1613,36 @@ def answer_with_rag(user_id, user_question):
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
 
     # --- ƯU TIÊN HỎI GIÁ ---
-    # Chỉ trả lời giá khi THỰC SỰ có filtered_hits
-    if is_price_question(user_question, lang) and filtered_hits:
+    if is_price_question(user_question, lang) and (filtered_hits or title_ok):
         print("➡️ route=price_question→price_with_suggestions")
-        reply, sug_hits = compose_price_with_suggestions(filtered_hits, lang=lang)
+        chosen = filtered_hits if filtered_hits else prod_hits
+        reply, sug_hits = compose_price_with_suggestions(chosen, lang=lang)
         return reply, sug_hits
 
-    # --- PRODUCT BRANCHES ---
-    # Siết chặt: “đủ” nghĩa là phải CÓ filtered_hits (không dựa vào điểm/tiêu đề)
-    not_enough = (not filtered_hits)
+    # --- NHÁNH SẢN PHẨM (STRICT) ---
+    strict_enough = bool(filtered_hits) or bool(title_ok)
 
-    if intent in {"product", "product_info"} and not_enough:
-        # 1) Có context → dùng LLM + context
+    if intent in {"product", "product_info"} and not strict_enough:
+        # Có context → trả lời từ context; nếu không có → fallback nhẹ/không gợi SP
         if context:
             print("➡️ route=ctx_fallback_from_product")
             ans = compose_contextual_answer(context, user_question, hist, lang=lang)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
-        # 2) Không có context → LLM trơn (giữ persona shop)
         if ALWAYS_ANSWER:
-            print("➡️ route=llm_fallback_from_product")
+            print("➡️ route=llm_fallback_from_product(no-suggest)")
             ans = compose_contextual_answer("", user_question, hist, lang=lang)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
-        # 3) Cuối cùng → mời xem web
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
         print("➡️ route=oos_hint")
         return t(lang, "oos", url=url), []
 
-    if intent == "product_info":
+    if intent == "product_info" and strict_enough:
         print("➡️ route=product_info")
-        return compose_product_info(filtered_hits, lang=lang), filtered_hits[:1]
+        return compose_product_info(filtered_hits or prod_hits, lang=lang), (filtered_hits or prod_hits)[:1]
 
-    # Chỉ gợi ý SP khi intent=product VÀ có filtered_hits
-    if intent == "product" and filtered_hits:
+    if intent in {"product", "other"} and strict_enough:
         print("➡️ route=product_reply")
-        return compose_product_reply(filtered_hits, lang=lang), filtered_hits[:2]
+        return compose_product_reply(filtered_hits or prod_hits, lang=lang), (filtered_hits or prod_hits)[:2]
 
     # --- CONTEXT FALLBACK CHUNG ---
     if context:
@@ -1785,6 +1777,7 @@ def chat_rag():
     return jsonify({"reply": reply})
 
 @app.route("/api/product_search")
+@app.route("/api/product_search")
 def api_product_search():
     try:
         q = (request.args.get("q") or "").strip()
@@ -1792,32 +1785,53 @@ def api_product_search():
             return jsonify({"ok": False, "msg": "missing q"}), 400
 
         lang = detect_lang(q)
+
+        # Không có index → trả câu dẫn xem web, không gợi ý SP
         if IDX_PROD is None:
             url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
             return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
 
+        # Tìm bằng FAISS + rerank theo độ giống tiêu đề
         hits, scores = search_products_with_scores(q, topk=8)
         hits = _rerank_by_title(q, hits, scores)
         scores = [h.get("score", 0.0) for h in hits]
-
         best = max(scores or [0.0])
 
+        # Lọc theo từ khoá/tags/title (strict). Với CJK ta KHÔNG dùng lọc keyword,
+        # chỉ chấp nhận item có trùng tiêu đề thực sự (title_ok per-item).
         kept = filter_hits_by_query(hits, q, lang=lang) if STRICT_MATCH else hits
-        
+        if _any_cjk(q):
+            strict_kept = []
+            for d in hits:
+                # Giữ item nếu tiêu đề item trùng với query theo bigram cover
+                if _has_title_overlap(q, [d]):
+                    strict_kept.append(d)
+            kept = strict_kept
+
+        # Kiểm tra trùng tiêu đề trên toàn danh sách (cứu cánh cho CJK)
+        title_ok = _has_title_overlap(q, hits)
+
+        # (Chỉ để debug cho biết, KHÔNG dùng để quyết định gợi ý)
         ok_by_score = _score_gate(q, hits, best)
-        title_ok    = _has_title_overlap(q, hits)
-        
-        if not kept or (not ok_by_score and not title_ok):
+
+        # HARD GATE: chỉ gợi ý khi có kept hoặc có title_ok
+        if not kept and not title_ok:
             url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
             return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
 
-        reply = compose_product_reply(kept, lang=lang)
-        resp = {"ok": True, "reply": reply, "items": kept[:2]}
+        # Nếu có kept thì ưu tiên kept; nếu kept rỗng nhưng title_ok=True → dùng hits
+        chosen = kept if kept else hits
+
+        reply = compose_product_reply(chosen, lang=lang)
+        resp = {"ok": True, "reply": reply, "items": chosen[:2]}
+
         if (request.args.get("debug") or "") == "1":
             resp["debug"] = {
-                "best": best, "hits": len(hits),
+                "best": best,
+                "hits": len(hits),
                 "kept_after_filter": len(kept),
-                "title_ok": bool(title_ok), "ok_by_score": bool(ok_by_score),
+                "title_ok": bool(title_ok),
+                "ok_by_score": bool(ok_by_score),
             }
         return jsonify(resp)
     except Exception as e:
