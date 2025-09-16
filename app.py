@@ -60,7 +60,7 @@ def _char_ngrams(s: str, n=2):
     return {s[i:i+n] for i in range(len(s)-n+1)}
 
 # --- Cross-language helpers ---
-CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af]")
 
 def _any_cjk(s: str) -> bool:
     return bool(CJK_RE.search(s or ""))
@@ -1758,7 +1758,9 @@ def chat_rag():
     print("🌐 /api/chat_rag question:", q)
     if not q:
         return jsonify({"error": "Missing 'question'"}), 400
-    reply, _ = answer_with_rag("anonymous", q)
+    uid = data.get("user_id") or f"anon:{int(time.time()*1000)}:{random.randint(0, 9999)}"
+    reply, _ = answer_with_rag(uid, q)
+
     return jsonify({"reply": reply})
 
 @app.route("/api/product_search")
@@ -1774,6 +1776,9 @@ def api_product_search():
             return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
 
         hits, scores = search_products_with_scores(q, topk=8)
+        hits = _rerank_by_title(q, hits, scores)
+        scores = [h.get("score", 0.0) for h in hits]
+
         best = max(scores or [0.0])
 
         kept = filter_hits_by_query(hits, q, lang=lang) if STRICT_MATCH else hits
