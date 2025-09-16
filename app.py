@@ -162,7 +162,7 @@ def _has_title_overlap(
     qtok = [w for w in qn1.split() if len(w) > 1]
 
     # CJK/không có khoảng trắng → so trùng bigram ký tự
-    if not qtok or re.search(r"[\u4e00-\u9fff]", q):
+    if not qtok or _any_cjk(q):  # <-- đổi từ re.search(...) sang _any_cjk(q)
         qgrams = _char_ngrams(qn1, 2) | _char_ngrams(qn2, 2)
         if not qgrams:
             return False
@@ -186,6 +186,7 @@ def _has_title_overlap(
 
 # (tuỳ chọn) Alias để tương thích nếu trước đây gọi tên hàm là "_"
 _ = _has_title_overlap
+
 
 # ========= BOOTSTRAP =========
 
