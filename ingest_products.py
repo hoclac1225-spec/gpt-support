@@ -6,9 +6,12 @@ import numpy as np, faiss
 from dotenv import load_dotenv
 from openai import OpenAI
 from urllib.parse import urlparse, parse_qs, quote
+import hashlib
 
+# --- Load .env TRƯỚC khi đọc os.getenv
 load_dotenv()
 
+# ==== Config ====
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 STORE            = os.getenv("SHOPIFY_STORE", "")              # ví dụ: xxx.myshopify.com
 TOKEN            = os.getenv("SHOPIFY_ADMIN_API_TOKEN", "")
@@ -18,8 +21,13 @@ FETCH_METAFIELDS = os.getenv("FETCH_METAFIELDS", "false").lower() == "true"
 EMBED_MODEL      = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # khớp app.py
 EMBED_BATCH      = int(os.getenv("EMBED_BATCH", "128"))
 API_VER          = os.getenv("SHOPIFY_API_VERSION", "2023-10")
-# locales cần kéo bản dịch (ví dụ: zh, zh-TW, zh-CN, th, id…)
 LOCALES          = [s.strip() for s in os.getenv("LOCALES", "zh,zh-TW,zh-CN").split(",") if s.strip()]
+TRAN_LOCALES     = [s.strip() for s in os.getenv("TRAN_LOCALES", "zh-CN,zh-TW,vi,en,th,id").split(",")]
+
+# Chống rác/timeout khi nhúng
+MIN_CHARS = int(os.getenv("CHUNK_MIN_CHARS", "60"))                # bỏ chunk quá ngắn
+EMBED_RETRIES = int(os.getenv("EMBED_RETRIES", "3"))               # số lần retry batch
+EMBED_RETRY_BASE_DELAY = float(os.getenv("EMBED_RETRY_BASE_DELAY", "1.2"))
 
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
@@ -38,18 +46,64 @@ def strip_html(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return html.unescape(s)
 
-def text_to_chunks(txt, maxlen=800):
-    txt = re.sub(r"\s+", " ", (txt or "")).strip()
-    return [txt[i:i+maxlen] for i in range(0, len(txt), maxlen)] or [""]
+def text_to_chunks(txt, maxlen=800, min_chars=MIN_CHARS):
+    """Cắt đoạn + lọc tối thiểu ký tự để tránh chunk rỗng."""
+    t = re.sub(r"\s+", " ", (txt or "")).strip()
+    if len(t) < min_chars:
+        return []
+    return [t[i:i+maxlen] for i in range(0, len(t), maxlen)]
 
-def embed_batch(texts, batch_size=128):
-    """Nhúng theo batch để tránh payload lớn/timeout."""
-    vecs = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
-        vecs.extend([np.array(e.embedding, dtype="float32") for e in resp.data])
-    return vecs
+def _canon(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _fingerprint(s: str) -> str:
+    return hashlib.sha1(_canon(s).encode("utf-8")).hexdigest()
+
+def filter_docs(docs, min_chars=MIN_CHARS):
+    """Lọc doc rỗng/quá ngắn & chuẩn hoá whitespace."""
+    out = []
+    for d in docs:
+        t = _canon(d.get("text", ""))
+        if len(t) < min_chars:
+            continue
+        dd = dict(d)
+        dd["text"] = t
+        out.append(dd)
+    return out
+
+def embed_batch(texts, batch_size=128, retries=EMBED_RETRIES):
+    """
+    Nhúng theo batch (retry khi lỗi) và degrade xuống từng item nếu batch fail.
+    Trả về: (vectors, keep_mask) với keep_mask[i]=True nếu item i nhúng ok.
+    """
+    vectors, keep = [], [False] * len(texts)
+    for start in range(0, len(texts), batch_size):
+        end = min(start + batch_size, len(texts))
+        chunk = texts[start:end]
+        # thử batch trước
+        done = False
+        for attempt in range(retries):
+            try:
+                resp = client.embeddings.create(model=EMBED_MODEL, input=chunk)
+                for j, e in enumerate(resp.data):
+                    vectors.append(np.array(e.embedding, dtype="float32"))
+                    keep[start + j] = True
+                done = True
+                break
+            except Exception:
+                if attempt + 1 < retries:
+                    time.sleep(EMBED_RETRY_BASE_DELAY * (attempt + 1))
+        if done:
+            continue
+        # degrade từng item
+        for j, t in enumerate(chunk):
+            try:
+                r1 = client.embeddings.create(model=EMBED_MODEL, input=[t])
+                vectors.append(np.array(r1.data[0].embedding, dtype="float32"))
+                keep[start + j] = True
+            except Exception:
+                pass
+    return vectors, keep
 
 def shop_product_url(handle: str) -> str:
     handle = (handle or "").strip()
@@ -133,7 +187,7 @@ def fetch_product_metafields(pid: int):
 def fetch_product_translations(pid: int, locales):
     """
     Dùng Translations API để lấy title/body_html theo từng locale.
-    Trả về: {locale: {"title": "...", "body_html": "..."}, ...}
+    Trả về: {locale: {'title': '...', 'body_html': '...'}, ...}
     """
     out = {}
     if not locales:
@@ -155,8 +209,6 @@ def fetch_product_translations(pid: int, locales):
         except Exception as e:
             print(f"⚠️ translation fetch error pid={pid} lc={lc}: {repr(e)}")
     return out
-# --- thêm gần phần fetch_* ---
-TRAN_LOCALES = [s.strip() for s in os.getenv("TRAN_LOCALES", "zh-CN,zh-TW,vi,en,th,id").split(",")]
 
 def fetch_translations(pid: int, locales=TRAN_LOCALES):
     """Lấy title/body/options/tags đã dịch từ Shopify Translations API."""
@@ -167,17 +219,15 @@ def fetch_translations(pid: int, locales=TRAN_LOCALES):
             params = {"locale": loc, "resource_type": "Product", "resource_id": pid}
             r = _get(u, params=params)
             arr = r.json().get("translations", []) or []
-            # gom nội dung hữu ích
             for t in arr:
                 k = (t.get("key") or "").lower()
                 v = (t.get("value") or "").strip()
-                if not v: 
+                if not v:
                     continue
                 if any(x in k for x in ["title","body_html","product_type","tags","option","name","value"]):
                     outs.append(v)
         except Exception as e:
             print("⚠️ translation fetch error pid=", pid, "loc=", loc, repr(e))
-    # lọc rác + rút gọn
     text = " | ".join(re.sub(r"<[^>]+>"," ", s) for s in outs if s)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -189,12 +239,10 @@ _ZH_T2S = {
     "可麗餅": "可丽饼",
 }
 KW_EXPANSIONS = {
-    # Triggers (có trong title/tags/body) -> các alias nên thêm vào tags
     "千層": ["千层", "mille crepe", "crepe", "可麗餅", "可丽饼", "เครป", "crepe cake"],
     "榴槤": ["榴莲", "durian", "ทุเรียน"],
     "可麗餅": ["可丽饼", "crepe", "mille crepe", "เครป"],
     "奶茶": ["milk tea", "bubble tea", "boba", "ชานม", "ชานมไข่มุก", "teh susu", "boba tea"],
-    # bạn có thể mở rộng thêm…
 }
 
 def _expand_aliases(text_blob: str) -> list[str]:
@@ -209,7 +257,6 @@ def _expand_aliases(text_blob: str) -> list[str]:
     for trig, alist in KW_EXPANSIONS.items():
         if trig in text_blob:
             adds.extend(alist)
-    # khử trùng lặp, trả dạng ' | ' join được
     out, seen = [], set()
     for x in adds:
         xx = x.strip()
@@ -234,38 +281,27 @@ def build_docs(products):
         published_at = p.get("published_at") or ""
         updated_at   = p.get("updated_at")   or ""
 
-        # options map: {"Color": ["Red","Blue"], ...}
         options_map = {(opt.get("name") or "").strip(): (opt.get("values") or [])
                        for opt in (p.get("options") or [])}
 
-        # ảnh đại diện
         first_image = ""
         if p.get("images"):
             first_image = (p["images"][0].get("src") or "").strip()
 
-        # metafields (nếu bật)
         specs_txt = fetch_product_metafields(p.get("id"))
 
-        # ✅ tạo blob để dò trigger & bơm alias đa ngôn ngữ vào tags
+        # ✅ alias đa ngôn ngữ vào tags
         trigger_blob = " ".join([title, tags_base, body, specs_txt])
         alias_list = _expand_aliases(trigger_blob)
         alias_str  = " | ".join(alias_list) if alias_list else ""
         tags = " | ".join([t for t in [tags_base, alias_str] if t]).strip()
 
-        # các biến dùng chung khi duyệt variants
         variants = p.get("variants") or [{}]
         first_price_fallback = None
 
         for v in variants:
-            # ---- fields cấp variant ----
             sku   = (v.get("sku") or "").strip()
             price = (v.get("price") or "").strip()
-            try:
-                # nếu muốn giữ số để app dễ parse, có thể dùng float
-                # nhưng ở đây ta giữ nguyên str và để app format lại
-                pass
-            except Exception:
-                pass
 
             qty = v.get("inventory_quantity")
             try:
@@ -273,32 +309,25 @@ def build_docs(products):
             except Exception:
                 qty = None
 
-            # available: ưu tiên flag của variant, sau đó dựa vào tồn kho/status
             available = bool(v.get("available", True))
             if qty is not None:
                 available = available and (qty > 0)
             if status and status != "active":
                 available = False
 
-            # dùng price đầu tiên làm fallback cho các chunk/variant khác nếu trống
             if first_price_fallback is None and price:
                 first_price_fallback = price
 
-            # caption variant (ví dụ: "Color: Red | Size: M")
             variant_caption = (v.get("title") or "").strip()
             if not variant_caption or variant_caption.lower() == "default title":
-                # ghép từ options để rõ ràng hơn
                 pieces = []
                 for k in options_map.keys():
-                    # Shopify lưu value thật trong v.get('option1'|'option2'|'option3')
-                    # map theo thứ tự Option1 -> option1, etc.
                     idx = len(pieces) + 1
                     val = (v.get(f"option{idx}") or "").strip()
                     if val:
                         pieces.append(f"{k}: {val}")
                 variant_caption = " | ".join(pieces) if pieces else "Default"
 
-            # ---- build base text cho RAG ----
             base = (
                 f"Product: {title}\n"
                 f"Type: {ptype}\nVendor: {vendor}\nTags: {tags}\n"
@@ -314,7 +343,6 @@ def build_docs(products):
                 f"URL: {url}"
             )
 
-            # ---- băm thành chunk & append meta ----
             for chunk in text_to_chunks(base, maxlen=800):
                 docs.append({
                     "type": "product",
@@ -323,7 +351,7 @@ def build_docs(products):
                     "handle": handle or "",
                     "tags": tags or "",
                     "url": url or "",
-                    "price": (price or first_price_fallback or ""),     # giữ dạng str
+                    "price": (price or first_price_fallback or ""),
                     "product_type": ptype or "",
                     "vendor": vendor or "",
                     "status": status or "active",
@@ -340,16 +368,14 @@ def build_docs(products):
 
     return docs
 
-
 def dedup_docs(docs):
-    """Loại trùng lặp nội dung để giảm nhiễu index."""
-    seen = set()
-    uniq = []
+    """Loại trùng lặp nội dung để giảm nhiễu index (ổn định theo SHA1)."""
+    seen, uniq = set(), []
     for d in docs:
-        h = hash(d["text"])
-        if h in seen:
+        fp = _fingerprint(d.get("text", ""))
+        if fp in seen:
             continue
-        seen.add(h)
+        seen.add(fp)
         uniq.append(d)
     return uniq
 
@@ -357,15 +383,31 @@ def dedup_docs(docs):
 def save_faiss(docs, index_path, meta_path):
     if not docs:
         raise RuntimeError("No docs to index.")
-    print(f"🧱 building embeddings for {len(docs)} chunks…")
-    X = np.vstack(embed_batch([d["text"] for d in docs], batch_size=EMBED_BATCH)).astype("float32")
+
+    # Lọc & chuẩn hoá để tránh rác
+    docs2 = filter_docs(docs, min_chars=MIN_CHARS)
+    if not docs2:
+        raise RuntimeError("All docs too short or empty after filtering.")
+
+    print(f"🧱 building embeddings for {len(docs2)} candidate chunks…")
+    vecs, keep = embed_batch([d["text"] for d in docs2], batch_size=EMBED_BATCH)
+
+    good_meta = [d for d, k in zip(docs2, keep) if k]
+    if not vecs or not good_meta:
+        raise RuntimeError("Embedding failed for all inputs.")
+
+    X = np.vstack(vecs).astype("float32")
     faiss.normalize_L2(X)
     index = faiss.IndexFlatIP(X.shape[1])
     index.add(np.ascontiguousarray(X))
+
     faiss.write_index(index, index_path)
-    atomic_write_json(meta_path, docs)
-    print(f"💾 Saved {len(docs)} chunks → {index_path}")
-    print(f"📝 Meta: {meta_path}")
+    atomic_write_json(meta_path, good_meta)
+
+    skipped = len(docs2) - len(good_meta)
+    print(f"💾 Saved {len(good_meta)} / {len(docs2)} chunks → {index_path}")
+    print(f"📝 Meta: {meta_path} | skipped: {skipped}")
+    return len(good_meta), skipped
 
 # ---------- main ----------
 if __name__ == "__main__":
@@ -373,5 +415,5 @@ if __name__ == "__main__":
     products = fetch_all_products()
     docs = build_docs(products)
     docs = dedup_docs(docs)
-    save_faiss(docs, f"{VECTOR_DIR}/products.index", f"{VECTOR_DIR}/products.meta.json")
-    print(f"✅ Done in {time.time() - t0:.1f}s")
+    saved, skipped = save_faiss(docs, f"{VECTOR_DIR}/products.index", f"{VECTOR_DIR}/products.meta.json")
+    print(f"✅ Done in {time.time() - t0:.1f}s | saved={saved} skipped={skipped}")
