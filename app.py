@@ -566,19 +566,34 @@ def admin_reload_vectors():
 def admin_rebuild_vectors_now():
     if not _admin_ok(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+
     try:
         t0 = time.time()
         products = fetch_all_products()
         docs = dedup_docs(build_docs(products))
         os.makedirs(VECTOR_DIR, exist_ok=True)
-        save_faiss(
-            docs,
-            os.path.join(VECTOR_DIR, "products.index"),
-            os.path.join(VECTOR_DIR, "products.meta.json"),
-        )
-        return jsonify({"ok": True, "chunks": len(docs), "t": round(time.time() - t0, 1)})
+
+        # đường dẫn
+        idx_path  = os.path.join(VECTOR_DIR, "products.index")
+        meta_path = os.path.join(VECTOR_DIR, "products.meta.json")
+        # ghi tạm để swap atomically (tránh đọc phải file chưa ghi xong)
+        idx_tmp   = idx_path  + ".tmp"
+        meta_tmp  = meta_path + ".tmp"
+
+        # build & ghi ra file tạm
+        save_faiss(docs, idx_tmp, meta_tmp)
+
+        # atomic swap
+        os.replace(idx_tmp,  idx_path)
+        os.replace(meta_tmp, meta_path)
+
+        # nạp index mới vào RAM ngay
+        ok = _reload_vectors()
+
+        return jsonify({"ok": ok, "chunks": len(docs), "t": round(time.time() - t0, 1)})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
