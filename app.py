@@ -273,6 +273,8 @@ EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 # Lọc & ngưỡng điểm
 SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.34"))
 STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
+# Chế độ khắt khe: phải khớp tiêu đề hoặc tags (ngoài các field khác)
+STRICT_REQUIRE_TITLE_OR_TAG = os.getenv("STRICT_REQUIRE_TITLE_OR_TAG", "true").lower() == "true"
 
 # ...
 print("=== BOOT ===")
@@ -1420,54 +1422,55 @@ def _query_tokens(q: str, lang: str = "vi") -> set:
 
 def filter_hits_by_query(hits, q, lang="vi"):
     """
-    Giữ hit nếu có token/cụm từ câu hỏi xuất hiện trong title/tags/type/variant (có & không dấu).
-    - Với CJK (zh/ja/ko): bỏ lọc cứng vì không có khoảng trắng → để FAISS + rerank lo.
-    - Fallback nới lỏng: nếu rỗng và câu hỏi ngắn → trả lại hits.
+    Chỉ giữ hit nếu token/cụm từ của query xuất hiện trong title/tags/product_type/variant.
+    - KHÔNG còn nới lỏng cho CJK hay câu ngắn.
+    - Nếu STRICT_REQUIRE_TITLE_OR_TAG=true: bắt buộc phải trùng title hoặc tags.
     """
     if not hits:
         return []
 
-    # 🔧 Query là CJK → không lọc cứng
-    if _any_cjk(q):
-        return hits
-
-    # Sinh token: có dấu + không dấu + bigram + synonyms (đã làm trong _query_tokens)
+    # dùng token hóa đa ngữ đã có sẵn
     qtoks = _query_tokens(q, lang=lang)
     if not qtoks:
-        return hits  # không có token để soi thì thôi không lọc
+        return []
 
     kept = []
     for d in hits:
-        # gom trường có ích để soi
+        title = d.get("title", "")
+        tags  = d.get("tags", "")
         hay_raw = " ".join(filter(None, [
-            d.get("title", ""),
-            d.get("title_zh", ""),          # ✅ thêm tiêu đề ZH nếu có
-            d.get("tags", ""),
+            title,
+            d.get("title_zh", ""),
+            tags,
             d.get("product_type", ""),
             d.get("variant", "")
         ]))
 
-        # normalize: có dấu / không dấu
+        # normalize 2 phiên bản: có dấu / không dấu (+ bản bỏ khoảng trắng)
         h1, h2 = _norm_both(hay_raw)
         h1_ns, h2_ns = h1.replace(" ", ""), h2.replace(" ", "")
 
-        ok = any(
-            (t in h1) or (t in h2) or               # khớp thường
-            (t.replace(" ", "") in h1_ns) or        # khớp bỏ khoảng trắng
+        ok_any_field = any(
+            (t in h1) or (t in h2) or
+            (t.replace(" ", "") in h1_ns) or
             (t.replace(" ", "") in h2_ns)
             for t in qtoks
         )
-        if ok:
-            kept.append(d)
+        if not ok_any_field:
+            continue
 
-    # 🔁 Fallback nới lỏng: câu ngắn (≤2 từ sau normalize) mà lọc rỗng → trả hits
-    qn = _normalize_text(q)
-    if not kept and len(qn.split()) <= 2 and len(hits) > 0:
-        return hits
+        # Bắt buộc phải khớp tiêu đề HOẶC tags (nếu bật cờ)
+        if STRICT_REQUIRE_TITLE_OR_TAG:
+            t1, t2 = _norm_both(title)
+            g1, g2 = _norm_both(tags)
+            title_ok = any(t in t1 or t in t2 for t in qtoks)
+            tags_ok  = any(t in g1 or t in g2 for t in qtoks)
+            if not (title_ok or tags_ok):
+                continue
+
+        kept.append(d)
 
     return kept
-
-
 
 def should_relax_filter(q: str, hits: list) -> bool:
     qn = _normalize_text(q)
@@ -1591,49 +1594,38 @@ def answer_with_rag(user_id, user_question):
 
     # ——— PRODUCT SEARCH ———
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
-    # NEW: rerank theo tiêu đề để đẩy đúng sản phẩm lên đầu
+    # Rerank theo tiêu đề để ưu tiên đúng sản phẩm
     prod_hits = _rerank_by_title(user_question, prod_hits, prod_scores)
     prod_scores = [h.get("score", 0.0) for h in prod_hits]
 
     best = max(prod_scores or [0.0])
-
     ok_by_score = _score_gate(user_question, prod_hits, best)
 
-
+    # STRICT MATCH: chỉ giữ các hit có token/cụm từ khớp trong title/tags/type/variant
     filtered_hits = filter_hits_by_query(prod_hits, user_question, lang=lang) if STRICT_MATCH else prod_hits
-    # nếu STRICT_MATCH làm rỗng mà catalog là ZH → nới lọc
-    if STRICT_MATCH and not filtered_hits and (_any_cjk(user_question) or _cjk_in_hits(prod_hits)):
-        filtered_hits = prod_hits
 
+    # CHỈ log tham khảo (không dùng để “bơm” lại sản phẩm)
     title_ok = _has_title_overlap(user_question, prod_hits)
-    # --- CỨU CÁNH THEO ĐIỂM ---
-    # nếu filter bị rỗng nhưng điểm đã đạt ngưỡng → giữ nguyên prod_hits
-    if not filtered_hits and ok_by_score:
-        filtered_hits = prod_hits
-
-    if title_ok and not filtered_hits:
-        filtered_hits = prod_hits
 
     print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
 
-    # --- CONTEXT/POLICY ---   # <— bỏ thụt vào đầu dòng
+    # --- CONTEXT/POLICY ---
     context = retrieve_context(user_question, topk=6)
     if intent == "policy" and context:
         ans = compose_contextual_answer(context, user_question, hist, lang=lang)
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
 
-
     # --- ƯU TIÊN HỎI GIÁ ---
-    if is_price_question(user_question, lang) and (filtered_hits or title_ok):
+    # Chỉ trả lời giá khi THỰC SỰ có filtered_hits
+    if is_price_question(user_question, lang) and filtered_hits:
         print("➡️ route=price_question→price_with_suggestions")
-        chosen = filtered_hits if filtered_hits else prod_hits
-        reply, sug_hits = compose_price_with_suggestions(chosen, lang=lang)
+        reply, sug_hits = compose_price_with_suggestions(filtered_hits, lang=lang)
         return reply, sug_hits
 
     # --- PRODUCT BRANCHES ---
-    # (nếu bạn đã thêm ok_by_score theo patch trước, dùng nó; chưa có thì thay ok_by_score bằng (best >= SCORE_MIN))
-    not_enough = (not filtered_hits) or (not ok_by_score and not title_ok)
+    # Siết chặt: “đủ” nghĩa là phải CÓ filtered_hits (không dựa vào điểm/tiêu đề)
+    not_enough = (not filtered_hits)
 
     if intent in {"product", "product_info"} and not_enough:
         # 1) Có context → dùng LLM + context
@@ -1641,12 +1633,12 @@ def answer_with_rag(user_id, user_question):
             print("➡️ route=ctx_fallback_from_product")
             ans = compose_contextual_answer(context, user_question, hist, lang=lang)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
-        # 2) Không có context → LLM trơn (shop_identity vẫn được chèn trong compose_contextual_answer)
+        # 2) Không có context → LLM trơn (giữ persona shop)
         if ALWAYS_ANSWER:
             print("➡️ route=llm_fallback_from_product")
             ans = compose_contextual_answer("", user_question, hist, lang=lang)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
-        # 3) Cuối cùng mới rơi về OOS
+        # 3) Cuối cùng → mời xem web
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
         print("➡️ route=oos_hint")
         return t(lang, "oos", url=url), []
@@ -1655,7 +1647,8 @@ def answer_with_rag(user_id, user_question):
         print("➡️ route=product_info")
         return compose_product_info(filtered_hits, lang=lang), filtered_hits[:1]
 
-    if intent in {"product", "other"} and filtered_hits and (ok_by_score or title_ok):
+    # Chỉ gợi ý SP khi intent=product VÀ có filtered_hits
+    if intent == "product" and filtered_hits:
         print("➡️ route=product_reply")
         return compose_product_reply(filtered_hits, lang=lang), filtered_hits[:2]
 
@@ -1670,7 +1663,6 @@ def answer_with_rag(user_id, user_question):
         ans = compose_contextual_answer("", user_question, hist, lang=lang)
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
     return t(lang, "fallback"), []
-
 
 # ========= WEBHOOK =========
 @app.route("/webhook", methods=["GET", "POST"])
@@ -1811,16 +1803,10 @@ def api_product_search():
         best = max(scores or [0.0])
 
         kept = filter_hits_by_query(hits, q, lang=lang) if STRICT_MATCH else hits
-        if STRICT_MATCH and not kept and should_relax_filter(q, hits):
-            kept = hits
-        if STRICT_MATCH and not kept and (_any_cjk(q) or _cjk_in_hits(hits)):
-            kept = hits
-
+        
         ok_by_score = _score_gate(q, hits, best)
         title_ok    = _has_title_overlap(q, hits)
-        if not kept and ok_by_score:
-            kept = hits
-
+        
         if not kept or (not ok_by_score and not title_ok):
             url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
             return jsonify({"ok": True, "reply": t(lang, "oos", url=url), "items": []})
@@ -1918,10 +1904,10 @@ def _start_vector_watcher():
 
 
 
-# ======== MAIN ========
 if __name__ == "__main__":
     if os.getenv("ENABLE_VECTOR_WATCHER", "true").lower() == "true":
         _start_vector_watcher()
     port = int(os.getenv("PORT", 3000))
     print(f"🚀 Starting app on 0.0.0.0:{port}")
-    # app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)  # <— đảm bảo KHÔNG bị comment
+
