@@ -21,8 +21,17 @@ FETCH_METAFIELDS = os.getenv("FETCH_METAFIELDS", "false").lower() == "true"
 EMBED_MODEL      = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # khớp app.py
 EMBED_BATCH      = int(os.getenv("EMBED_BATCH", "128"))
 API_VER          = os.getenv("SHOPIFY_API_VERSION", "2023-10")
-LOCALES          = [s.strip() for s in os.getenv("LOCALES", "zh,zh-TW,zh-CN").split(",") if s.strip()]
-TRAN_LOCALES     = [s.strip() for s in os.getenv("TRAN_LOCALES", "zh-CN,zh-TW,vi,en,th,id").split(",")]
+
+# ✅ mở rộng đa ngôn ngữ mặc định
+LOCALES = [s.strip() for s in os.getenv(
+    "LOCALES",
+    "zh,zh-CN,zh-TW,ja,ko,th,id,vi,en,fr,es,de,pt,ru"
+).split(",") if s.strip()]
+TRAN_LOCALES = [s.strip() for s in os.getenv(
+    "TRAN_LOCALES",
+    "zh,zh-CN,zh-TW,ja,ko,th,id,vi,en,fr,es,de,pt,ru"
+).split(",")]
+
 CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "900"))  # 900–1200 là hợp lý
 
 # Chống rác/timeout khi nhúng
@@ -291,8 +300,32 @@ def build_docs(products):
 
         specs_txt = fetch_product_metafields(p.get("id"))
 
-        # ✅ alias đa ngôn ngữ vào tags
-        trigger_blob = " ".join([title, tags_base, body, specs_txt])
+        # 🔎 Lấy dịch theo mọi locale (title/body)
+        trans_map = fetch_product_translations(p.get("id"), LOCALES)  # {locale: {'title','body_html'}}
+        # trích riêng CJK title cho meta
+        title_zh = (
+            (trans_map.get("zh") or {}).get("title") or
+            (trans_map.get("zh-CN") or {}).get("title") or
+            (trans_map.get("zh-TW") or {}).get("title") or
+            ""
+        )
+        title_ja = (trans_map.get("ja") or {}).get("title") or ""
+        title_ko = (trans_map.get("ko") or {}).get("title") or ""
+
+        # Gom khối dịch đa ngữ để embed
+        ml_bits = []
+        for loc, rec in (trans_map or {}).items():
+            tloc = (rec.get("title") or "").strip()
+            bloc = strip_html(rec.get("body_html") or "")
+            if tloc or bloc:
+                ml_bits.append(f"[{loc}] {tloc} | {bloc}")
+        extra_trans = " | ".join(x for x in ml_bits if x).strip()
+
+        # (tuỳ chọn) Gom thêm các bản dịch rải rác khác (tags/options/values…)
+        trans_blob = fetch_translations(p.get("id"), TRAN_LOCALES)
+
+        # ✅ alias đa ngôn ngữ vào tags (tính cả phần dịch)
+        trigger_blob = " ".join([title, tags_base, body, specs_txt, extra_trans, trans_blob])
         alias_list = _expand_aliases(trigger_blob)
         alias_str  = " | ".join(alias_list) if alias_list else ""
         tags = " | ".join([t for t in [tags_base, alias_str] if t]).strip()
@@ -301,13 +334,9 @@ def build_docs(products):
         first_price_fallback = None
 
         for v in variants:
-            # ngay dưới:
             sku   = (v.get("sku") or "").strip()
             price = (v.get("price") or "").strip()
-
-            # THÊM DÒNG NÀY:
             variant_id = v.get("id")
-
 
             qty = v.get("inventory_quantity")
             try:
@@ -346,6 +375,7 @@ def build_docs(products):
                 f"Status: {status}\n"
                 f"{('Specs: ' + specs_txt) if specs_txt else ''}\n"
                 f"Body: {body}\n"
+                f"{('Translations_ML: ' + ' | '.join([extra_trans, trans_blob]).strip(' |')) if (extra_trans or trans_blob) else ''}\n"
                 f"URL: {url}"
             )
 
@@ -354,6 +384,9 @@ def build_docs(products):
                     "type": "product",
                     "id": p.get("id"),
                     "title": title or "",
+                    "title_zh": title_zh or "",
+                    "title_ja": title_ja or "",
+                    "title_ko": title_ko or "",
                     "handle": handle or "",
                     "tags": tags or "",
                     "url": url or "",
@@ -394,7 +427,6 @@ def dedup_docs(docs):
         seen.add(key)
         uniq.append(d)
     return uniq
-
 
 # ---------- save ----------
 def save_faiss(docs, index_path, meta_path):
