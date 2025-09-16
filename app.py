@@ -91,7 +91,7 @@ def _score_gate(q: str, hits: list, best: float) -> bool:
 
 # --- Title overlap config (đặt ở cấp module, sau load_dotenv) ---
 TITLE_MIN_WORDS = int(os.getenv("TITLE_MIN_WORDS", "3"))
-TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.30"))
+TITLE_CJK_MIN_COVER = float(os.getenv("TITLE_CJK_MIN_COVER", "0.7"))
 TITLE_MAX_CHECK = int(os.getenv("TITLE_MAX_CHECK", "5"))
 # ==== Title normalization & similarity (đa ngôn ngữ) ====
 # bỏ emoji/kí hiệu Surrogate Plane (không ảnh hưởng chữ VN/CJK)
@@ -1419,26 +1419,54 @@ def _query_tokens(q: str, lang: str = "vi") -> set:
 
 
 def filter_hits_by_query(hits, q, lang="vi"):
-    """Giữ hit nếu có token/cụm từ câu hỏi xuất hiện trong title/tags/type/variant (có & không dấu)."""
+    """
+    Giữ hit nếu có token/cụm từ câu hỏi xuất hiện trong title/tags/type/variant (có & không dấu).
+    - Với CJK (zh/ja/ko): bỏ lọc cứng vì không có khoảng trắng → để FAISS + rerank lo.
+    - Fallback nới lỏng: nếu rỗng và câu hỏi ngắn → trả lại hits.
+    """
     if not hits:
         return []
+
+    # 🔧 Query là CJK → không lọc cứng
+    if _any_cjk(q):
+        return hits
+
+    # Sinh token: có dấu + không dấu + bigram + synonyms (đã làm trong _query_tokens)
     qtoks = _query_tokens(q, lang=lang)
+    if not qtoks:
+        return hits  # không có token để soi thì thôi không lọc
 
     kept = []
     for d in hits:
-        hay_raw = " ".join([
-            d.get("title",""), d.get("tags",""), d.get("product_type",""), d.get("variant","")
-        ])
+        # gom trường có ích để soi
+        hay_raw = " ".join(filter(None, [
+            d.get("title", ""),
+            d.get("title_zh", ""),          # ✅ thêm tiêu đề ZH nếu có
+            d.get("tags", ""),
+            d.get("product_type", ""),
+            d.get("variant", "")
+        ]))
+
+        # normalize: có dấu / không dấu
         h1, h2 = _norm_both(hay_raw)
         h1_ns, h2_ns = h1.replace(" ", ""), h2.replace(" ", "")
 
         ok = any(
-            (t in h1) or (t in h2) or (t.replace(" ","") in h1_ns) or (t.replace(" ","") in h2_ns)
+            (t in h1) or (t in h2) or               # khớp thường
+            (t.replace(" ", "") in h1_ns) or        # khớp bỏ khoảng trắng
+            (t.replace(" ", "") in h2_ns)
             for t in qtoks
         )
         if ok:
             kept.append(d)
+
+    # 🔁 Fallback nới lỏng: câu ngắn (≤2 từ sau normalize) mà lọc rỗng → trả hits
+    qn = _normalize_text(q)
+    if not kept and len(qn.split()) <= 2 and len(hits) > 0:
+        return hits
+
     return kept
+
 
 
 def should_relax_filter(q: str, hits: list) -> bool:
