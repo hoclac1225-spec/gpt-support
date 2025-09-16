@@ -17,15 +17,17 @@ app = Flask(__name__)
 CORS(app, resources={
     r"/api/*": {
         "origins": [
+            "https://shop.aloha.id.vn",   # <- THÊM DÒNG NÀY
             "https://aloha.id.vn",
             "https://www.aloha.id.vn",
             "https://9mn9fa-6p.myshopify.com",
         ],
         "supports_credentials": True,
-        "allow_headers": ["Content-Type", "Authorization", "X-Admin-Token"],
+        "allow_headers": ["Content-Type", "content-type", "Authorization", "X-Admin-Token"],
         "methods": ["GET", "POST", "OPTIONS"],
     }
 })
+
 
 # Load .env TRƯỚC khi đọc os.getenv
 load_dotenv()
