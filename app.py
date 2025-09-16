@@ -559,6 +559,21 @@ def _admin_ok(req):
     token = hdr or qp
     return (not ADMIN_TOKEN) or (token == ADMIN_TOKEN)
 
+@app.route("/debug/product_coverage")
+def product_coverage():
+    pids, handles, vids = set(), set(), set()
+    for d in (META_PROD or []):
+        if d.get("id"):         pids.add(str(d["id"]))
+        if d.get("handle"):     handles.add(d["handle"])
+        if d.get("variant_id"): vids.add(str(d["variant_id"]))
+    return jsonify({
+        "chunks": len(META_PROD or []),
+        "unique_products_by_id": len(pids),
+        "unique_handles": len(handles),
+        "unique_variants": len(vids),
+    })
+
+
 @app.post("/admin/reload_vectors")
 def admin_reload_vectors():
     if not _admin_ok(request):
@@ -641,7 +656,11 @@ def search_products_with_scores(query, topk=8):
         for idx, score in zip(I[0], D[0]):
             if 0 <= idx < len(META_PROD):
                 d = META_PROD[idx]
-                key = (d.get("url"), (d.get("title") or "").lower().strip())
+                key = (
+                    d.get("url"),
+                    (d.get("title") or "").lower().strip(),
+                    str(d.get("variant_id") or d.get("sku") or d.get("variant") or "")
+                    )
                 if key in seen:
                     continue
                 seen.add(key)
