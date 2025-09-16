@@ -23,6 +23,7 @@ EMBED_BATCH      = int(os.getenv("EMBED_BATCH", "128"))
 API_VER          = os.getenv("SHOPIFY_API_VERSION", "2023-10")
 LOCALES          = [s.strip() for s in os.getenv("LOCALES", "zh,zh-TW,zh-CN").split(",") if s.strip()]
 TRAN_LOCALES     = [s.strip() for s in os.getenv("TRAN_LOCALES", "zh-CN,zh-TW,vi,en,th,id").split(",")]
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "900"))  # 900–1200 là hợp lý
 
 # Chống rác/timeout khi nhúng
 MIN_CHARS = int(os.getenv("CHUNK_MIN_CHARS", "60"))                # bỏ chunk quá ngắn
@@ -46,7 +47,7 @@ def strip_html(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return html.unescape(s)
 
-def text_to_chunks(txt, maxlen=800, min_chars=MIN_CHARS):
+def text_to_chunks(txt, maxlen=CHUNK_MAX_CHARS, min_chars=MIN_CHARS):
     """Cắt đoạn + lọc tối thiểu ký tự để tránh chunk rỗng."""
     t = re.sub(r"\s+", " ", (txt or "")).strip()
     if len(t) < min_chars:
@@ -300,8 +301,13 @@ def build_docs(products):
         first_price_fallback = None
 
         for v in variants:
+            # ngay dưới:
             sku   = (v.get("sku") or "").strip()
             price = (v.get("price") or "").strip()
+
+            # THÊM DÒNG NÀY:
+            variant_id = v.get("id")
+
 
             qty = v.get("inventory_quantity")
             try:
@@ -343,7 +349,7 @@ def build_docs(products):
                 f"URL: {url}"
             )
 
-            for chunk in text_to_chunks(base, maxlen=800):
+            for chunk in text_to_chunks(base, maxlen=CHUNK_MAX_CHARS):
                 docs.append({
                     "type": "product",
                     "id": p.get("id"),
@@ -356,6 +362,7 @@ def build_docs(products):
                     "vendor": vendor or "",
                     "status": status or "active",
                     "sku": sku or "",
+                    "variant_id": str(variant_id or ""),
                     "variant": variant_caption or "Default",
                     "image": first_image or "",
                     "inventory_quantity": qty if (qty is None or isinstance(qty, int)) else None,
@@ -369,15 +376,25 @@ def build_docs(products):
     return docs
 
 def dedup_docs(docs):
-    """Loại trùng lặp nội dung để giảm nhiễu index (ổn định theo SHA1)."""
-    seen, uniq = set(), []
+    """
+    Dedup an toàn: giữ riêng từng variant.
+    Key gồm: (product_id, variant_id/sku/variant_caption, hash(text)).
+    """
+    seen = set()
+    uniq = []
     for d in docs:
-        fp = _fingerprint(d.get("text", ""))
-        if fp in seen:
+        text_fp = _fingerprint(d.get("text", ""))
+        key = (
+            str(d.get("id") or ""),
+            str(d.get("variant_id") or d.get("sku") or d.get("variant") or ""),
+            text_fp,
+        )
+        if key in seen:
             continue
-        seen.add(fp)
+        seen.add(key)
         uniq.append(d)
     return uniq
+
 
 # ---------- save ----------
 def save_faiss(docs, index_path, meta_path):
