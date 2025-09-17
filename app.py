@@ -673,6 +673,71 @@ def disk_status():
 # --- Admin auth (strip + đa kênh + tắt tạm thời) ---
 ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()
 DISABLE_ADMIN_AUTH = os.getenv("DISABLE_ADMIN_AUTH", "false").lower() == "true"
+# ========= CJK / ZH DEBUG =========
+@app.get("/debug/zh_stats")
+def debug_zh_stats():
+    def is_cjk(s):
+        return bool(CJK_RE.search(s or ""))
+    total = len(META_PROD or [])
+    zh_title = 0
+    zh_tags  = 0
+    zh_any   = 0
+    langs    = {}
+    for d in (META_PROD or []):
+        t = (d.get("title") or "")
+        g = (d.get("tags")  or "")
+        any_cjk = is_cjk(t) or is_cjk(g) or is_cjk(d.get("product_type") or "")
+        if is_cjk(t): zh_title += 1
+        if is_cjk(g): zh_tags  += 1
+        if any_cjk:   zh_any   += 1
+        lg = (d.get("lang") or "").lower().strip() or "unknown"
+        langs[lg] = langs.get(lg, 0) + 1
+    return jsonify({
+        "total_chunks": total,
+        "zh_title": zh_title,
+        "zh_tags": zh_tags,
+        "zh_any_field": zh_any,
+        "lang_field_counts": dict(sorted(langs.items(), key=lambda kv: (-kv[1], kv[0]))),
+    })
+
+@app.get("/debug/zh_sample")
+def debug_zh_sample():
+    """Trả về n tiêu đề có CJK để mắt thường check."""
+    n = int(request.args.get("n", 10))
+    out = []
+    for d in (META_PROD or []):
+        if CJK_RE.search((d.get("title") or "")) or CJK_RE.search((d.get("tags") or "")):
+            out.append({
+                "title": d.get("title"),
+                "tags": d.get("tags"),
+                "url": d.get("url"),
+                "product_type": d.get("product_type"),
+            })
+        if len(out) >= n:
+            break
+    return jsonify({"count": len(out), "items": out})
+
+@app.get("/debug/search_title")
+def debug_search_title():
+    """Tìm thẳng trong meta (substring, không embedding): q có thể là '榴槤', '千層', '奶茶'..."""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "msg": "missing q"}), 400
+    qn1, qn2 = _norm_both(q)
+    found = []
+    for d in (META_PROD or []):
+        t1, t2 = _norm_both(d.get("title") or "")
+        g1, g2 = _norm_both(d.get("tags") or "")
+        if (qn1 in t1) or (qn2 in t2) or (qn1 in g1) or (qn2 in g2):
+            found.append({
+                "title": d.get("title"),
+                "tags": d.get("tags"),
+                "url": d.get("url"),
+                "product_type": d.get("product_type"),
+            })
+        if len(found) >= 30:
+            break
+    return jsonify({"ok": True, "hits": len(found), "items": found})
 
 # --- helpers ---
 def _admin_ok(req):
