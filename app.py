@@ -328,6 +328,20 @@ def _remember(user_id, role, text):
         s["hist"].append({"role": role, "content": text})
 
 
+# ==== Rebuild background state ====
+REBUILD_STATUS = {"running": False, "last_ok": None, "error": None, "last_stats": None}
+REBUILD_LOCK = threading.Lock()
+
+def _bg_rebuild():
+    with REBUILD_LOCK:
+        REBUILD_STATUS.update({"running": True, "error": None})
+        try:
+            stats = rebuild_vectors_now()
+            REBUILD_STATUS.update({"last_ok": True, "last_stats": stats})
+        except Exception as e:
+            REBUILD_STATUS.update({"last_ok": False, "error": str(e)})
+        finally:
+            REBUILD_STATUS["running"] = False
 
 
 # ========= OPENAI WRAPPER =========
@@ -773,25 +787,25 @@ def admin_rebuild_vectors_now():
         if not _admin_ok(request):
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-        # Nếu muốn an toàn tài nguyên, có thể chạy nền:
-        # from threading import Thread
-        # def _bg():
-        #     try:
-        #         rebuild_vectors_now()
-        #     except Exception:
-        #         app.logger.exception("Background rebuild failed")
-        # Thread(target=_bg, daemon=True).start()
-        # return jsonify({"ok": True, "started": True})
+        if REBUILD_STATUS.get("running"):
+            # Đang chạy rồi → trả 202 để client biết không cần gọi tiếp
+            return jsonify({"ok": True, "running": True, "msg": "rebuild is in progress"}), 202
 
-        stats = rebuild_vectors_now()
-        return jsonify({"ok": True, **(stats or {})})
+        t = threading.Thread(target=_bg_rebuild, daemon=True)
+        t.start()
+        # QUAN TRỌNG: trả ngay để tránh timeout proxy
+        return jsonify({"ok": True, "started": True}), 202
     except MemoryError:
         app.logger.exception("OOM while rebuilding vectors")
         return jsonify({"ok": False, "error": "out_of_memory"}), 500
     except Exception as e:
         app.logger.exception("rebuild_vectors_now failed")
         return jsonify({"ok": False, "error": str(e)}), 500
-
+@app.get("/admin/rebuild_status")
+def admin_rebuild_status():
+    if not _admin_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return jsonify({"ok": True, **REBUILD_STATUS})
 
 @app.post("/admin/reload_vectors")
 def admin_reload_vectors():
