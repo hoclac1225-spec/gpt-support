@@ -1827,6 +1827,29 @@ def chat_rag():
     reply, _ = answer_with_rag(uid, q)
 
     return jsonify({"reply": reply})
+@app.post("/api/chat_shopify")
+def chat_shopify():
+    data = request.json or {}
+    q = (data.get("question") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "msg": "Missing question"}), 400
+
+    uid  = data.get("user_id") or f"shopify:{int(time.time()*1000)}:{random.randint(0,9999)}"
+    lang = detect_lang(q)
+
+    reply, btn_hits = answer_with_rag(uid, q)
+
+    items = []
+    for h in (btn_hits or [])[:2]:
+        items.append({
+            "title": h.get("title"),
+            "url": h.get("url"),
+            "price": _fmt_price(_price_value(h), h.get("currency") or ("₫" if lang == "vi" else "")),
+            "available": bool(h.get("available", True))
+        })
+
+    return jsonify({"ok": True, "reply": reply, "items": items, "lang": lang})
+
 
 @app.route("/api/product_search")
 def api_product_search():
