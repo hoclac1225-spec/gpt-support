@@ -10,6 +10,7 @@ from openai import OpenAI
 import hmac, hashlib, base64
 from typing import Optional
 from ingest_products import fetch_all_products, build_docs, dedup_docs, save_faiss
+import psutil, shutil
 
 
 # --- Flask & CORS ---
@@ -537,21 +538,93 @@ def _safe_read_index(prefix):
 IDX_PROD, META_PROD = _safe_read_index("products")
 IDX_POL,  META_POL  = _safe_read_index("policies")
 
+# ========= ADMIN HELPERS (sau _reload_vectors) =========
+
+# ========= ADMIN HELPERS (sau _reload_vectors) =========
+
 def _reload_vectors():
     global IDX_PROD, META_PROD, IDX_POL, META_POL
     try:
         IDX_PROD, META_PROD = _safe_read_index("products")
         IDX_POL,  META_POL  = _safe_read_index("policies")
         ok = (IDX_PROD is not None or IDX_POL is not None)
-        print("🔄 Reload vectors:", ok,
-              "| prod_chunks=", (len(META_PROD) if META_PROD else 0),
-              "| policy_chunks=", (len(META_POL) if META_POL else 0))
-        return ok
+
+        stats = {
+            "reloaded": bool(ok),
+            "products_index": bool(IDX_PROD),
+            "products_chunks": len(META_PROD) if META_PROD else 0,
+            "policies_index": bool(IDX_POL),
+            "policies_chunks": len(META_POL) if META_POL else 0,
+        }
+        print("🔄 Reload vectors:", stats)
+        return stats
     except Exception as e:
         print("❌ reload vectors:", repr(e))
-        return False
-# ==== Diagnostics: sizes & memory ====
-import psutil, shutil
+        return {"reloaded": False, "error": str(e)}
+
+
+def rebuild_vectors_now():
+    """
+    Rebuild lại FAISS cho products từ nguồn Shopify (policies giữ nguyên nếu bạn không có
+    pipeline riêng cho policies). Sau khi build xong sẽ gọi _reload_vectors().
+
+    Ghi chú:
+    - SHOPIFY_SHOP cần set đúng (ví dụ: 'your-shop.myshopify.com').
+    - save_faiss(...) có thể khác chữ ký tuỳ bạn cài, nên mình thử vài biến thể.
+    """
+    if not SHOPIFY_SHOP:
+        raise ValueError("SHOPIFY_SHOP env var is empty. Set SHOPIFY_STORE / SHOPIFY_SHOP properly.")
+
+    t0 = time.time()
+    print("🛠️ Rebuilding product vectors from Shopify…")
+
+    # 1) Lấy dữ liệu & build docs
+    products = fetch_all_products(SHOPIFY_SHOP)
+    docs = build_docs(products)
+    docs = dedup_docs(docs)
+
+    # 2) Lưu FAISS index + meta cho prefix "products"
+    #    Tùy chữ ký hàm save_faiss trong ingest_products của bạn, thử các biến thể:
+    saved = False
+    last_err = None
+    for kwargs in (
+        {"out_dir": VECTOR_DIR, "prefix": "products"},
+        {"out_dir": VECTOR_DIR},                        # có lib mặc định prefix="products"
+    ):
+        try:
+            save_faiss(docs, **kwargs)
+            saved = True
+            print(f"💾 save_faiss OK with args={kwargs}")
+            break
+        except TypeError as e:
+            # thử positional fallback: save_faiss(docs, VECTOR_DIR, "products")
+            last_err = e
+        except Exception as e:
+            last_err = e
+
+    if not saved:
+        try:
+            save_faiss(docs, VECTOR_DIR, "products")   # positional fallback
+            saved = True
+            print("💾 save_faiss OK with positional args (docs, VECTOR_DIR, 'products')")
+        except Exception as e:
+            last_err = e
+
+    if not saved:
+        raise RuntimeError(f"save_faiss failed with all signatures. Last error: {last_err!r}")
+
+    # 3) Reload vào RAM
+    _reload_vectors()
+
+    dt = (time.time() - t0)
+    return {
+        "rebuilt": True,
+        "elapsed_sec": round(dt, 2),
+        "products_chunks": len(META_PROD) if META_PROD else 0,
+        "policies_chunks": len(META_POL) if META_POL else 0,
+        "products_index": bool(IDX_PROD),
+        "policies_index": bool(IDX_POL),
+    }
 
 def _file_size_mb(path):
     try:
@@ -601,83 +674,59 @@ def disk_status():
 ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN", "") or "").strip()
 DISABLE_ADMIN_AUTH = os.getenv("DISABLE_ADMIN_AUTH", "false").lower() == "true"
 
+# --- helpers ---
 def _admin_ok(req):
+    token = req.headers.get("X-Admin-Token") or req.args.get("token")
     if DISABLE_ADMIN_AUTH:
         return True
-    hdr = (req.headers.get("X-Admin-Token") or "").strip()
-    qp  = (req.args.get("token") or "").strip()  # cho phép ?token=...
-    token = hdr or qp
-    return (not ADMIN_TOKEN) or (token == ADMIN_TOKEN)
+    return bool(token) and token == ADMIN_TOKEN
 
-@app.route("/debug/product_coverage")
-def product_coverage():
-    pids, handles, vids = set(), set(), set()
-    for d in (META_PROD or []):
-        if d.get("id"):         pids.add(str(d["id"]))
-        if d.get("handle"):     handles.add(d["handle"])
-        if d.get("variant_id"): vids.add(str(d["variant_id"]))
-    return jsonify({
-        "chunks": len(META_PROD or []),
-        "unique_products_by_id": len(pids),
-        "unique_handles": len(handles),
-        "unique_variants": len(vids),
-    })
+
+@app.errorhandler(Exception)
+def _on_unhandled(e):
+    app.logger.exception("Unhandled error")
+    return jsonify({"ok": False, "error": str(e)}), 500
+
+# --- admin endpoints (an toàn hơn) ---
+# ========= ADMIN ENDPOINTS =========
+
+@app.post("/admin/rebuild_vectors_now")
+def admin_rebuild_vectors_now():
+    try:
+        if not _admin_ok(request):
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        # Nếu muốn an toàn tài nguyên, có thể chạy nền:
+        # from threading import Thread
+        # def _bg():
+        #     try:
+        #         rebuild_vectors_now()
+        #     except Exception:
+        #         app.logger.exception("Background rebuild failed")
+        # Thread(target=_bg, daemon=True).start()
+        # return jsonify({"ok": True, "started": True})
+
+        stats = rebuild_vectors_now()
+        return jsonify({"ok": True, **(stats or {})})
+    except MemoryError:
+        app.logger.exception("OOM while rebuilding vectors")
+        return jsonify({"ok": False, "error": "out_of_memory"}), 500
+    except Exception as e:
+        app.logger.exception("rebuild_vectors_now failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.post("/admin/reload_vectors")
 def admin_reload_vectors():
-    if not _admin_ok(request):
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    ok = _reload_vectors()
-    return jsonify({"ok": ok})
-
-@app.post("/admin/rebuild_vectors_now")
-def admin_rebuild_vectors_now():
-    if not _admin_ok(request):
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
     try:
-        t0 = time.time()
-        products = fetch_all_products()
-        docs = dedup_docs(build_docs(products))
-        os.makedirs(VECTOR_DIR, exist_ok=True)
+        if not _admin_ok(request):
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        stats = _reload_vectors()
+        return jsonify({"ok": True, **(stats or {})})
 
-        idx_path  = os.path.join(VECTOR_DIR, "products.index")
-        meta_path = os.path.join(VECTOR_DIR, "products.meta.json")
-        idx_tmp   = idx_path  + ".tmp"
-        meta_tmp  = meta_path + ".tmp"
-
-        # Ghi file tạm
-        save_faiss(docs, idx_tmp, meta_tmp)
-
-        # 👉 ĐẾM SỐ “THỰC SỰ” ĐÃ GHI
-        try:
-            saved_ntotal = int(getattr(faiss.read_index(idx_tmp), "ntotal", 0))
-        except Exception:
-            saved_ntotal = 0
-        try:
-            saved_meta = len(json.load(open(meta_tmp, encoding="utf-8")))
-        except Exception:
-            saved_meta = 0
-
-        # Atomic swap
-        os.replace(idx_tmp,  idx_path)
-        os.replace(meta_tmp, meta_path)
-
-        # Reload vào RAM
-        ok = _reload_vectors()
-
-        return jsonify({
-            "ok": ok,
-            "docs_after_dedup": len(docs),        # số doc sau build+dedup
-            "saved_to_index": saved_ntotal,       # số vector thực đã ghi
-            "saved_meta": saved_meta,             # số item trong meta (nên = saved_to_index)
-            "skipped": max(0, len(docs) - saved_ntotal),
-            "t": round(time.time() - t0, 1)
-        })
     except Exception as e:
+        app.logger.exception("reload_vectors failed")
         return jsonify({"ok": False, "error": str(e)}), 500
-
 def _embed_query(q: str) -> Optional[np.ndarray]:
     try:
         t0 = time.time()
@@ -1655,6 +1704,9 @@ def answer_with_rag(user_id, user_question):
         ans = compose_contextual_answer("", user_question, hist, lang=lang)
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
     return t(lang, "fallback"), []
+@app.get("/_ping")
+def _ping():
+    return jsonify({"ok": True})
 
 # ========= WEBHOOK =========
 @app.route("/webhook", methods=["GET", "POST"])
@@ -1776,7 +1828,6 @@ def chat_rag():
 
     return jsonify({"reply": reply})
 
-@app.route("/api/product_search")
 @app.route("/api/product_search")
 def api_product_search():
     try:
@@ -1902,8 +1953,10 @@ def _watch_vectors():
     newest = max(_mtime(idx_p), _mtime(meta_p), _mtime(idx_k), _mtime(meta_k))
     if newest and newest != _last_vec_mtime:
         print("🕵️ Detected vector change → reload")
-        if _reload_vectors():
+        stats = _reload_vectors()
+        if stats.get("reloaded"):
             _last_vec_mtime = newest
+
 
 def _start_vector_watcher():
     try:
