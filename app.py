@@ -552,7 +552,7 @@ def debug_zh_stats():
         zh_title = zh_tags = zh_any = 0
         langs = {}
         for d in meta:
-            t = (d.get("title") or "")
+            t = " ".join([(d.get("title") or ""), (d.get("title_zh") or "")])
             g = (d.get("tags") or "")
             any_cjk = is_cjk(t) or is_cjk(g) or is_cjk(d.get("product_type") or "")
             zh_title += int(is_cjk(t))
@@ -580,7 +580,16 @@ def debug_zh_sample():
         n = int(request.args.get("n", 10))
         out = []
         for d in meta:
-            if cjk_re.search((d.get("title") or "")) or cjk_re.search((d.get("tags") or "")):
+            if (cjk_re.search(d.get("title") or "") or
+                cjk_re.search(d.get("title_zh") or "") or
+                cjk_re.search(d.get("tags") or "")):
+                out.append({
+                    "title": d.get("title"),
+                    "title_zh": d.get("title_zh"),   # cho tiện nhìn
+                    "tags": d.get("tags"),
+                    "url": d.get("url"),
+                    "product_type": d.get("product_type"),
+                })
                 out.append({
                     "title": d.get("title"),
                     "tags": d.get("tags"),
@@ -604,21 +613,25 @@ def debug_search_title():
 
     try:
         meta = globals().get("META_PROD") or []
-        qn1 = _normalize_text(q)
-        qn2 = _normalize_text(_strip_accents(q))
+        qn1 = _normalize_text(q); qn2 = _normalize_text(_strip_accents(q))
         found = []
         for d in meta:
             t1 = _normalize_text(d.get("title") or "")
             t2 = _normalize_text(_strip_accents(d.get("title") or ""))
+            tz1 = _normalize_text(d.get("title_zh") or "")           # NEW
+            tz2 = _normalize_text(_strip_accents(d.get("title_zh") or ""))  # NEW
             g1 = _normalize_text(d.get("tags") or "")
             g2 = _normalize_text(_strip_accents(d.get("tags") or ""))
-            if (qn1 and (qn1 in t1 or qn1 in g1)) or (qn2 and (qn2 in t2 or qn2 in g2)):
+            if ((qn1 and (qn1 in t1 or qn1 in tz1 or qn1 in g1)) or
+                (qn2 and (qn2 in t2 or qn2 in tz2 or qn2 in g2))):
                 found.append({
                     "title": d.get("title"),
+                    "title_zh": d.get("title_zh"),   # NEW
                     "tags": d.get("tags"),
                     "url": d.get("url"),
                     "product_type": d.get("product_type"),
                 })
+
             if len(found) >= 50:
                 break
         return jsonify({"ok": True, "hits": len(found), "items": found})
@@ -664,39 +677,18 @@ def rebuild_vectors_now():
     print("🛠️ Rebuilding product vectors from Shopify…")
 
     # 1) Lấy dữ liệu & build docs
-    products = fetch_all_products(SHOPIFY_SHOP)
+    products = fetch_all_products()
     docs = build_docs(products)
     docs = dedup_docs(docs)
 
     # 2) Lưu FAISS index + meta cho prefix "products"
     #    Tùy chữ ký hàm save_faiss trong ingest_products của bạn, thử các biến thể:
-    saved = False
-    last_err = None
-    for kwargs in (
-        {"out_dir": VECTOR_DIR, "prefix": "products"},
-        {"out_dir": VECTOR_DIR},                        # có lib mặc định prefix="products"
-    ):
-        try:
-            save_faiss(docs, **kwargs)
-            saved = True
-            print(f"💾 save_faiss OK with args={kwargs}")
-            break
-        except TypeError as e:
-            # thử positional fallback: save_faiss(docs, VECTOR_DIR, "products")
-            last_err = e
-        except Exception as e:
-            last_err = e
+   # 2) Lưu FAISS index + meta (khớp chữ ký ingest_products.save_faiss)
+    index_path = os.path.join(VECTOR_DIR, "products.index")
+    meta_path  = os.path.join(VECTOR_DIR, "products.meta.json")
+    save_faiss(docs, index_path, meta_path)
+    print("💾 save_faiss OK:", index_path, meta_path)
 
-    if not saved:
-        try:
-            save_faiss(docs, VECTOR_DIR, "products")   # positional fallback
-            saved = True
-            print("💾 save_faiss OK with positional args (docs, VECTOR_DIR, 'products')")
-        except Exception as e:
-            last_err = e
-
-    if not saved:
-        raise RuntimeError(f"save_faiss failed with all signatures. Last error: {last_err!r}")
 
     # 3) Reload vào RAM
     _reload_vectors()
