@@ -1508,23 +1508,37 @@ add_syn("越南", ["vietnam","việt nam","vn"])
 
 
 # --- Bổ sung đồng nghĩa cho shop (TW/繁體) ---
+# đặt gần đầu file, cạnh detect_lang:
+LANGS_WITH_SPACES = {"vi","en","id","th","ko","ja"}
+MIN_WORD_LEN = 3  # bỏ từ đơn < 3 ký tự để tránh 'ho', 'ai', 'an'...
 
+def _wordset(s: str) -> set:
+    s = _normalize_text(s)
+    return {w for w in s.split() if len(w) >= MIN_WORD_LEN}
 
+def _contains_phrase(hay: str, phrase: str) -> bool:
+    # so khớp cụm nguyên vẹn (có khoảng trắng)
+    hay = " " + _normalize_text(hay) + " "
+    ph  = " " + _normalize_text(phrase) + " "
+    return ph in hay
 
 def _query_tokens(q: str, lang: str = "vi") -> set:
-    """Sinh token từ câu hỏi: có dấu, không dấu, bigram, cụm phrase và synonyms."""
+    """Sinh token từ câu hỏi: chỉ giữ từ đơn >=3 ký tự; vẫn giữ cụm 2 từ; cộng synonyms."""
     n1, n2 = _norm_both(q)
-    w1 = [w for w in n1.split() if len(w) > 1]
-    w2 = [w for w in n2.split() if len(w) > 1]
+    w1 = [w for w in n1.split() if len(w) >= MIN_WORD_LEN]
+    w2 = [w for w in n2.split() if len(w) >= MIN_WORD_LEN]
 
     tokens = set(w1) | set(w2)
 
-    # bigram cho cả có dấu & không dấu (bắt 'sầu riêng', 'banh sau'...)
-    for words in (w1, w2):
+    # bigram cụm hai từ (giữ dạng có khoảng trắng). KHÔNG thêm bản "dính liền" nếu <3 ký tự.
+    for words in (n1.split(), n2.split()):
+        words = [w for w in words if len(w) >= MIN_WORD_LEN]
         for i in range(len(words) - 1):
-            tokens.add((words[i] + " " + words[i+1]).strip())
-            tokens.add((words[i] + words[i+1]).strip())  # biến thể không space
+            phrase = (words[i] + " " + words[i+1]).strip()
+            if len(phrase.replace(" ", "")) >= MIN_WORD_LEN:
+                tokens.add(phrase)
 
+    # cụm cố định theo ngôn ngữ (nếu xuất hiện trong câu hỏi)
     combo_phrases = {
         "vi": ["đồng hồ","dây đồng hồ","kính cường lực","ốp lưng","áo thun","áo phông","bánh crepe","bánh sầu riêng","trà sữa"],
         "en": ["watch band","screen protector","phone case","t shirt","t-shirt","mille crepe","durian crepe","milk tea","bubble tea","boba tea"],
@@ -1532,17 +1546,14 @@ def _query_tokens(q: str, lang: str = "vi") -> set:
         "th": ["นาฬิกา","สายนาฬิกา","ฟิล์มกระจก","เคสโทรศัพท์","เสื้อยืด","เครป","เครปทุเรียน","ชานมไข่มุก"],
         "id": ["jam tangan","tali jam","pelindung layar","casing hp","kaos","kue crepe","crepe durian","teh susu","bubble tea","boba"]
     }
-
-    joined_n1 = " ".join(w1)
+    joined_n1 = " " + n1 + " "
     for phrase in combo_phrases.get(lang, []):
-        if phrase in joined_n1:
-            p1, p2 = _norm_both(phrase)
-            tokens.update({p1, p2, p1.replace(" ", ""), p2.replace(" ", "")})
+        if (" " + phrase + " ") in joined_n1:
+            tokens.add(phrase)
 
-    # Ánh xạ synonyms (đặt NGOÀI vòng for phrase)
+    # synonyms: nếu query chứa 1 key (hoặc synonym) thì bơm tất cả synonym vào tokens
     for key, syns in VN_SYNONYMS.items():
         key_n1, key_n2 = _norm_both(key)
-
         seen = (key_n1 in n1) or (key_n2 in n2)
         if not seen:
             for s in syns:
@@ -1550,61 +1561,69 @@ def _query_tokens(q: str, lang: str = "vi") -> set:
                 if s1 in n1 or s2 in n2:
                     seen = True
                     break
-
         if seen:
             for s in [key] + list(syns):
                 s1, s2 = _norm_both(s)
-                tokens.update({s1, s2, s1.replace(" ", ""), s2.replace(" ", "")})
+                # chỉ thêm nếu là từ >=3 hoặc là cụm (có space)
+                for t in {s1, s2}:
+                    if (" " in t) or (len(t) >= MIN_WORD_LEN):
+                        tokens.add(t)
 
-    return {t for t in tokens if len(t) >= 2}
-
+    return tokens
 
 
 def filter_hits_by_query(hits, q, lang="vi"):
     """
-    Chỉ giữ hit nếu token/cụm từ của query xuất hiện trong title/tags/product_type/variant.
-    - KHÔNG còn nới lỏng cho CJK hay câu ngắn.
-    - Nếu STRICT_REQUIRE_TITLE_OR_TAG=true: bắt buộc phải trùng title hoặc tags.
+    Giữ hit nếu:
+      - (ngôn ngữ có khoảng trắng) giao nhau giữa tập từ >=3 ký tự, hoặc cụm-phrase xuất hiện nguyên vẹn
+      - (CJK) vẫn dùng _has_title_overlap per-item
+    Nếu STRICT_REQUIRE_TITLE_OR_TAG=true: yêu cầu khớp ở title HOẶC tags theo logic trên.
     """
     if not hits:
         return []
 
-    # dùng token hóa đa ngữ đã có sẵn
-    qtoks = _query_tokens(q, lang=lang)
-    if not qtoks:
+    # CJK: để nguyên nhánh cũ – kiểm từng item theo _has_title_overlap
+    if _any_cjk(q):
+        strict_kept = []
+        for d in hits:
+            if _has_title_overlap(q, [d]):
+                strict_kept.append(d)
+        return strict_kept
+
+    # Ngôn ngữ có khoảng trắng
+    qtokens = _query_tokens(q, lang=lang)
+    if not qtokens:
         return []
+
+    q_words = {t for t in qtokens if " " not in t and len(t) >= MIN_WORD_LEN}
+    q_phr   = {t for t in qtokens if " " in t}
 
     kept = []
     for d in hits:
         title = d.get("title", "")
         tags  = d.get("tags", "")
-        hay_raw = " ".join(filter(None, [
-            title,
-            d.get("title_zh", ""),
-            tags,
-            d.get("product_type", ""),
-            d.get("variant", "")
-        ]))
+        other = " ".join(filter(None, [d.get("title_zh",""), d.get("product_type",""), d.get("variant","")]))
 
-        # normalize 2 phiên bản: có dấu / không dấu (+ bản bỏ khoảng trắng)
-        h1, h2 = _norm_both(hay_raw)
-        h1_ns, h2_ns = h1.replace(" ", ""), h2.replace(" ", "")
+        # tập từ (>=3) cho từng field
+        t_words = _wordset(title)
+        g_words = _wordset(tags)
+        o_words = _wordset(other)
 
-        ok_any_field = any(
-            (t in h1) or (t in h2) or
-            (t.replace(" ", "") in h1_ns) or
-            (t.replace(" ", "") in h2_ns)
-            for t in qtoks
+        # cụm-phrase nguyên vẹn?
+        in_title_phrase = any(_contains_phrase(title, p) for p in q_phr)
+        in_tags_phrase  = any(_contains_phrase(tags, p) for p in q_phr)
+        in_other_phrase = any(_contains_phrase(other, p) for p in q_phr)
+
+        ok_any_field = (
+            bool(q_words & (t_words | g_words | o_words)) or
+            in_title_phrase or in_tags_phrase or in_other_phrase
         )
         if not ok_any_field:
             continue
 
-        # Bắt buộc phải khớp tiêu đề HOẶC tags (nếu bật cờ)
         if STRICT_REQUIRE_TITLE_OR_TAG:
-            t1, t2 = _norm_both(title)
-            g1, g2 = _norm_both(tags)
-            title_ok = any(t in t1 or t in t2 for t in qtoks)
-            tags_ok  = any(t in g1 or t in g2 for t in qtoks)
+            title_ok = bool(q_words & t_words) or in_title_phrase
+            tags_ok  = bool(q_words & g_words) or in_tags_phrase
             if not (title_ok or tags_ok):
                 continue
 
