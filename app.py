@@ -945,9 +945,17 @@ def compose_new_arrivals(lang: str = "vi", items=None):
 
 
 # ========= INTENT, PERSONA, FEW-SHOT & NATURAL REPLY =========
-GREETS = {"hi","hello","hey","helo","heloo","hí","hì","chào","xin chào","alo","aloha","hello bot","hi bot"}
+GREETS = {
+    "hi","hello","hey","helo","heloo","hí","hì","chào","xin chào","alo","aloha","hello bot","hi bot",
+    # zh-Hant / zh chung
+    "你好","您好","嗨","哈囉","哈啰","哈咯","嗨～","哈囉～"
+}
+
 def is_greeting(text: str) -> bool:
     t = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    # nếu là CJK và ngắn (<= 6 ký tự hiển thị) → coi là greet
+    if _any_cjk(t) and len(t) <= 6:
+        return True
     return any(w in t for w in GREETS) and len(t) <= 40
 
 # ——— Ngôn ngữ: detect & câu chữ
@@ -1693,11 +1701,17 @@ def compose_product_info(hits, lang: str = "vi"):
     return rephrase_casual(raw, intent="product", lang=lang)
 
 
-def compose_contextual_answer(context, question, history, lang="vi"):
-    ctx = (shop_identity(lang) + "\n" + (context or "")).strip()
+def compose_contextual_answer(context, question, history, lang="vi", channel=None):
+    # Nếu là Shopify web → ép model trả đúng ngôn ngữ người dùng
+    lang_hint = f"\n\n[IMPORTANT] Reply strictly in {lang}."
+    if channel != "shopify":  # Messenger/IG giữ nguyên, không ép
+        lang_hint = ""
+
+    ctx = (shop_identity(lang) + "\n" + (context or "") + lang_hint).strip()
     msgs = build_messages(SYSTEM_STYLE, history, ctx, question)
     _, reply = call_openai(msgs, temperature=0.6)
     return reply
+
 
 
 def compose_price_with_suggestions(hits, lang: str = "vi"):
@@ -1731,15 +1745,12 @@ def compose_price_with_suggestions(hits, lang: str = "vi"):
     # Thêm SP chính vào button đầu tiên
     btns = [main] + [x for x in (high, low) if x]
     return rephrase_casual(raw, intent="product", lang=lang), btns[:2]
-def answer_with_rag(user_id, user_question):
-    s = _get_sess(user_id)
-    hist = s["hist"]
-
+def answer_with_rag(user_id, user_question, channel=None):
+    s = _get_sess(user_id); hist = s["hist"]
     intent = detect_intent(user_question)
     lang = detect_lang(user_question)
-    print(f"🔎 intent={intent} | 🗣️ lang={lang}")
+    print(f"🔎 intent={intent} | 🗣️ lang={lang} | 📡 channel={channel}")
 
-    # ——— QUICK ROUTES ———
     if intent == "greet":
         return greet_text(lang), []
     if intent == "smalltalk":
@@ -1751,45 +1762,40 @@ def answer_with_rag(user_id, user_question):
         items = get_new_arrivals(days=30, topk=4)
         return compose_new_arrivals(lang=lang, items=items), items[:2]
 
-    # ——— PRODUCT SEARCH ———
+    # PRODUCT SEARCH (giữ nguyên phần hiện có) ...
     prod_hits, prod_scores = search_products_with_scores(user_question, topk=8)
-    # rerank theo độ giống tiêu đề
     prod_hits = _rerank_by_title(user_question, prod_hits, prod_scores)
     prod_scores = [h.get("score", 0.0) for h in prod_hits]
     best = max(prod_scores or [0.0])
 
-    # CHỈ dùng lọc keyword/title – KHÔNG “cứu” theo score
     filtered_hits = filter_hits_by_query(prod_hits, user_question, lang=lang) if STRICT_MATCH else prod_hits
     title_ok = _has_title_overlap(user_question, prod_hits)
 
     print(f"📈 best_score={best:.3f}, hits={len(prod_hits)}, kept_after_filter={len(filtered_hits)}, title_ok={title_ok}")
 
-    # --- CONTEXT/POLICY ---
     context = retrieve_context(user_question, topk=6)
+
     if intent == "policy" and context:
-        ans = compose_contextual_answer(context, user_question, hist, lang=lang)
+        ans = compose_contextual_answer(context, user_question, hist, lang=lang, channel=channel)
         ans = f"{t(lang,'policy_hint')} {ans}"
         return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
 
-    # --- ƯU TIÊN HỎI GIÁ ---
     if is_price_question(user_question, lang) and (filtered_hits or title_ok):
         print("➡️ route=price_question→price_with_suggestions")
         chosen = filtered_hits if filtered_hits else prod_hits
         reply, sug_hits = compose_price_with_suggestions(chosen, lang=lang)
         return reply, sug_hits
 
-    # --- NHÁNH SẢN PHẨM (STRICT) ---
     strict_enough = bool(filtered_hits) or bool(title_ok)
 
     if intent in {"product", "product_info"} and not strict_enough:
-        # Có context → trả lời từ context; nếu không có → fallback nhẹ/không gợi SP
         if context:
             print("➡️ route=ctx_fallback_from_product")
-            ans = compose_contextual_answer(context, user_question, hist, lang=lang)
+            ans = compose_contextual_answer(context, user_question, hist, lang=lang, channel=channel)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
         if ALWAYS_ANSWER:
             print("➡️ route=llm_fallback_from_product(no-suggest)")
-            ans = compose_contextual_answer("", user_question, hist, lang=lang)
+            ans = compose_contextual_answer("", user_question, hist, lang=lang, channel=channel)
             return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
         url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
         print("➡️ route=oos_hint")
@@ -1803,17 +1809,17 @@ def answer_with_rag(user_id, user_question):
         print("➡️ route=product_reply")
         return compose_product_reply(filtered_hits or prod_hits, lang=lang), (filtered_hits or prod_hits)[:2]
 
-    # --- CONTEXT FALLBACK CHUNG ---
     if context:
         print("➡️ route=ctx_fallback")
-        ans = compose_contextual_answer(context, user_question, hist, lang=lang)
+        ans = compose_contextual_answer(context, user_question, hist, lang=lang, channel=channel)
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
 
     print("➡️ route=fallback")
     if ALWAYS_ANSWER:
-        ans = compose_contextual_answer("", user_question, hist, lang=lang)
+        ans = compose_contextual_answer("", user_question, hist, lang=lang, channel=channel)
         return rephrase_casual(ans, intent="generic", temperature=0.7, lang=lang), []
     return t(lang, "fallback"), []
+
 @app.get("/_ping")
 def _ping():
     return jsonify({"ok": True})
@@ -1944,10 +1950,11 @@ def chat_shopify():
     if not q:
         return jsonify({"ok": False, "msg": "Missing question"}), 400
 
+    channel = (data.get("channel") or "").lower()  # <-- lấy channel từ payload
     uid  = data.get("user_id") or f"shopify:{int(time.time()*1000)}:{random.randint(0,9999)}"
     lang = detect_lang(q)
 
-    reply, btn_hits = answer_with_rag(uid, q)
+    reply, btn_hits = answer_with_rag(uid, q, channel=channel)  # <-- truyền channel
 
     items = []
     for h in (btn_hits or [])[:2]:
@@ -1959,6 +1966,7 @@ def chat_shopify():
         })
 
     return jsonify({"ok": True, "reply": reply, "items": items, "lang": lang})
+
 
 
 @app.route("/api/product_search")
