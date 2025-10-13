@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: aloha-bot
+    env: python
+    plan: starter
+    region: singapore
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: ./bin/start.sh
+    autoDeploy: true
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DATA_DIR
+        value: ./data
+      - key: VECTOR_DIR
+        value: /var/aloha-vectors
+      - key: EMBED_MODEL
+        value: text-embedding-3-small
+      # Shopify (nếu dùng)
+      - key: SHOPIFY_STORE
+        sync: false
+      - key: SHOPIFY_ADMIN_API_TOKEN
+        sync: false
+      - key: SHOPIFY_API_VERSION
+        value: 2023-10
+      # Admin & webhook
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: VERIFY_TOKEN
+        value: aloha_verify_123
+      - key: ENABLE_VECTOR_WATCHER
+        value: "true"
+    disks:
+      - name: aloha-vectors
+        mountPath: /var/aloha-vectors
+        sizeGB: 1
