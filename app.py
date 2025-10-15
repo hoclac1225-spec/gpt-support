@@ -827,6 +827,68 @@ def admin_reload_vectors():
     except Exception as e:
         app.logger.exception("reload_vectors failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+# === Policy admin (runtime canned answers) ===
+@app.post("/admin/policy_set")
+def admin_policy_set():
+    if not _admin_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    data = request.json or {}
+    lang = (data.get("lang") or DEFAULT_LANG).lower()
+    topic = (data.get("topic") or "").lower()
+    text  = (data.get("template") or "").strip()
+
+    # Validate đầu vào
+    if not lang or not topic or not text:
+        return jsonify({"ok": False, "error": "missing lang/topic/template"}), 400
+    if lang not in POLICY_TEMPLATES or topic not in POLICY_TEMPLATES.get(lang, {}):
+        return jsonify({"ok": False, "error": "invalid lang/topic"}), 400
+
+    POLICY_TEMPLATES[lang][topic] = text
+    return jsonify({"ok": True, "lang": lang, "topic": topic})
+@app.get("/admin/policy_get")
+def admin_policy_get():
+    if not _admin_ok(request):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    lang    = (request.args.get("lang") or DEFAULT_LANG).lower()
+    topic   = (request.args.get("topic") or "").lower()
+    preview = str(request.args.get("preview") or "0").lower() in ("1", "true", "yes")
+
+    # Trả tất cả ngôn ngữ
+    if lang == "all":
+        if preview:
+            rendered = {}
+            for l, topics in POLICY_TEMPLATES.items():
+                cfg = POLICY_CFG.get(l, {}) or POLICY_CFG.get(DEFAULT_LANG, {})
+                rendered[l] = {k: v.format(**cfg) for k, v in topics.items()}
+            return jsonify({"ok": True, "templates": POLICY_TEMPLATES, "preview": rendered})
+        return jsonify({"ok": True, "templates": POLICY_TEMPLATES})
+
+    # Theo 1 ngôn ngữ
+    tpls = POLICY_TEMPLATES.get(lang) or {}
+    if not tpls:
+        return jsonify({"ok": False, "error": "lang not found"}), 404
+
+    # Theo 1 topic
+    if topic:
+        tpl = tpls.get(topic)
+        if not tpl:
+            return jsonify({"ok": False, "error": "topic not found"}), 404
+        resp = {"ok": True, "lang": lang, "topic": topic, "template": tpl}
+        if preview:
+            cfg = POLICY_CFG.get(lang, {}) or POLICY_CFG.get(DEFAULT_LANG, {})
+            resp["preview"] = tpl.format(**cfg)
+        return jsonify(resp)
+
+    # Trả toàn bộ topic của lang
+    resp = {"ok": True, "lang": lang, "templates": tpls}
+    if preview:
+        cfg = POLICY_CFG.get(lang, {}) or POLICY_CFG.get(DEFAULT_LANG, {})
+        resp["preview"] = {k: v.format(**cfg) for k, v in tpls.items()}
+    return jsonify(resp)
+
+
 def _embed_query(q: str) -> Optional[np.ndarray]:
     try:
         t0 = time.time()
@@ -1104,6 +1166,50 @@ LANG_STRINGS = {
 
 }
 
+# ==== POLICY CANNED (đa ngôn ngữ) ====
+# Có thể kéo từ .env để thay đổi không cần deploy lại
+POLICY_CFG = {
+    "vi": {
+        "return_days": int(os.getenv("POLICY_VI_RETURN_DAYS", "7")),
+        "warranty_months": int(os.getenv("POLICY_VI_WARRANTY_MONTHS", "3")),
+        "ship_eta": os.getenv("POLICY_VI_SHIP_ETA", "1–3 ngày nội địa"),
+        "support_email": os.getenv("POLICY_SUPPORT_EMAIL", "support@aloha.id.vn"),
+    },
+    "en": {
+        "return_days": int(os.getenv("POLICY_EN_RETURN_DAYS", "7")),
+        "warranty_months": int(os.getenv("POLICY_EN_WARRANTY_MONTHS", "3")),
+        "ship_eta": os.getenv("POLICY_EN_SHIP_ETA", "1–3 business days (domestic)"),
+        "support_email": os.getenv("POLICY_SUPPORT_EMAIL", "support@aloha.id.vn"),
+    },
+    "zh": {
+        "return_days": int(os.getenv("POLICY_ZH_RETURN_DAYS", "7")),
+        "warranty_months": int(os.getenv("POLICY_ZH_WARRANTY_MONTHS", "3")),
+        "ship_eta": os.getenv("POLICY_ZH_SHIP_ETA", "国内 1–3 天"),
+        "support_email": os.getenv("POLICY_SUPPORT_EMAIL", "support@aloha.id.vn"),
+    },
+}
+
+# Mẫu trả lời (template) cho từng chủ đề chính sách
+POLICY_TEMPLATES = {
+    "vi": {
+        "returns": "Đổi/Trả: Shop hỗ trợ đổi hoặc trả trong {return_days} ngày nếu sản phẩm còn nguyên tem/mác và chưa qua sử dụng. Giữ hoá đơn/đơn hàng giúp mình nhé. Cần hỗ trợ thêm, email {support_email}.",
+        "warranty": "Bảo hành: Sản phẩm được bảo hành {warranty_months} tháng lỗi kỹ thuật của nhà sản xuất. Không áp dụng với hư hỏng do tác động, nước, hoặc tự ý can thiệp.",
+        "shipping": "Vận chuyển: Thời gian giao hàng dự kiến {ship_eta}. Đơn nội thành có thể nhanh hơn tuỳ khu vực.",
+        "contact": "Liên hệ: Bạn có thể chat ngay tại đây hoặc email {support_email}. Mình luôn sẵn sàng hỗ trợ.",
+    },
+    "en": {
+        "returns": "Returns: We accept returns within {return_days} days if the item is unused and in original condition with tags. Please keep your receipt/order email. For help: {support_email}.",
+        "warranty": "Warranty: {warranty_months}-month manufacturer defect warranty. Physical damage, water damage, or unauthorized repairs are excluded.",
+        "shipping": "Shipping: Estimated delivery time is {ship_eta}. In-city deliveries may be faster depending on area.",
+        "contact": "Contact: Chat here or email {support_email}. We’re happy to help.",
+    },
+    "zh": {
+        "returns": "退换：自收货起 {return_days} 天内支持退换（商品未使用且保持完整标签/包装）。保留订单/发票以便处理。协助邮箱：{support_email}。",
+        "warranty": "保修：{warranty_months} 个月厂家质量问题保修。不含人为损坏、进水或擅自拆修。",
+        "shipping": "配送：预计 {ship_eta} 送达，同城通常更快（视区域而定）。",
+        "contact": "联系：可在此处咨询，或电邮 {support_email}。我们很乐意协助。",
+    },
+}
 
 def t(lang: str, key: str, **kw) -> str:
     lang2 = lang if lang in LANG_STRINGS else DEFAULT_LANG
@@ -1239,6 +1345,39 @@ FEW_SHOT_EXAMPLES = [
 ]
 # ---- Intent routing ----
 POLICY_KEYWORDS  = {"chính sách","đổi trả","bảo hành","ship","vận chuyển","giao hàng","trả hàng","refund"}
+
+# Regex nhận diện chủ đề chính sách
+POLICY_REGEX = {
+    "returns": [
+        r"(đổi|trả|đổi\s*trả|hoàn\s*tiền)",     # VI
+        r"\b(return|refunds?)\b",               # EN
+        r"(退|退货|退貨|退款|換貨|换货)",          # ZH
+    ],
+    "warranty": [
+        r"(bảo\s*hành|bh|bảo\s*tri|bảo\s*trì)",
+        r"\b(warranty|guarantee)\b",
+        r"(保修|保固)",
+    ],
+    "shipping": [
+        r"(giao\s*hàng|vận\s*chuyển|ship|ship\s*code|cod)",
+        r"\b(shipping|delivery|ship)\b",
+        r"(配送|快递|送货|運送|運輸)",
+    ],
+    "contact": [
+        r"(liên\s*hệ|hỗ\s*trợ|CSKH|support)",
+        r"\b(contact|support|help)\b",
+        r"(联系|客服)",
+    ],
+}
+
+def _match_policy_topic(text: str) -> Optional[str]:
+    low = (text or "").lower()
+    for topic, pats in POLICY_REGEX.items():
+        for p in pats:
+            if re.search(p, low, flags=re.I):
+                return topic
+    return None
+
 PRODUCT_KEYWORDS = {
     "mua","bán","giá","size","kích thước","chất liệu","màu","hợp","phù hợp",
     "dây","đồng hồ","vòng","case","áo","quần","áo phông","tshirt","t-shirt","áo thun",
@@ -1257,6 +1396,9 @@ def detect_intent(text: str):
     raw = (text or "")
     t0  = re.sub(r"\s+", " ", raw.lower()).strip()
     lang = detect_lang(raw)
+     # 🔍 ƯU TIÊN regex chính sách trước
+    if _match_policy_topic(raw):
+        return "policy"
 
     if any(k in t0 for k in POLICY_KEYWORDS):  return "policy"
     if is_greeting(raw):                       return "greet"
@@ -1711,16 +1853,29 @@ def compose_product_info(hits, lang: str = "vi"):
 
 
 def compose_contextual_answer(context, question, history, lang="vi", channel=None):
-    # Nếu là Shopify web → ép model trả đúng ngôn ngữ người dùng
+    # Luôn ép ngôn ngữ theo người hỏi
     lang_hint = f"\n\n[IMPORTANT] Reply strictly in {lang}."
-    if channel != "shopify":  # Messenger/IG giữ nguyên, không ép
-        lang_hint = ""
 
     ctx = (shop_identity(lang) + "\n" + (context or "") + lang_hint).strip()
     msgs = build_messages(SYSTEM_STYLE, history, ctx, question)
     _, reply = call_openai(msgs, temperature=0.6)
     return reply
 
+
+def compose_policy_canned(question: str, lang: str) -> Optional[str]:
+    topic = _match_policy_topic(question)
+    if not topic:
+        return None
+    # lấy cấu hình theo lang; fallback về DEFAULT_LANG
+    l = lang if lang in POLICY_TEMPLATES else DEFAULT_LANG
+    cfg = POLICY_CFG.get(l) or POLICY_CFG.get(DEFAULT_LANG, {})
+    tpl = POLICY_TEMPLATES.get(l, {}).get(topic)
+    if not tpl:
+        return None
+    txt = tpl.format(**cfg).strip()
+    # thêm nhãn “Theo chính sách shop: …” + rephrase nhẹ
+    ans = f"{t(lang,'policy_hint')} {txt}"
+    return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang)
 
 
 def compose_price_with_suggestions(hits, lang: str = "vi"):
@@ -1784,10 +1939,21 @@ def answer_with_rag(user_id, user_question, channel=None):
 
     context = retrieve_context(user_question, topk=6)
 
-    if intent == "policy" and context:
-        ans = compose_contextual_answer(context, user_question, hist, lang=lang, channel=channel)
-        ans = f"{t(lang,'policy_hint')} {ans}"
-        return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
+    if intent == "policy":
+        # 1) thử canned trước
+        canned = compose_policy_canned(user_question, lang=lang)
+        if canned:
+            return canned, []
+        # 2) nếu không có canned → RAG (như cũ)
+        context = retrieve_context(user_question, topk=6)
+        if context:
+            ans = compose_contextual_answer(context, user_question, hist, lang=lang, channel=channel)
+            ans = f"{t(lang,'policy_hint')} {ans}"
+            return rephrase_casual(ans, intent="policy", temperature=0.5, lang=lang), []
+        # 3) fallback
+        url = SHOP_URL_MAP.get(lang, SHOP_URL_MAP.get(DEFAULT_LANG, SHOP_URL))
+        return t(lang, "browse", url=url), []
+
 
     if is_price_question(user_question, lang) and (filtered_hits or title_ok):
         print("➡️ route=price_question→price_with_suggestions")
