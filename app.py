@@ -1,4 +1,4 @@
-﻿
+
 # -*- coding: utf-8 -*-
 import unicodedata
 import os, json, time, re, requests, numpy as np, faiss, threading, random
@@ -272,7 +272,7 @@ REPHRASE_ENABLED = os.getenv("REPHRASE_ENABLED", "true").lower() == "true"
 EMOJI_MODE       = os.getenv("EMOJI_MODE", "cute")  # "cute" | "none"
 
 # Lọc & ngưỡng điểm
-SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.34"))
+SCORE_MIN = float(os.getenv("PRODUCT_SCORE_MIN", "0.50"))
 STRICT_MATCH = os.getenv("STRICT_MATCH", "true").lower() == "true"
 # Chế độ khắt khe: phải khớp tiêu đề hoặc tags (ngoài các field khác)
 STRICT_REQUIRE_TITLE_OR_TAG = os.getenv("STRICT_REQUIRE_TITLE_OR_TAG", "true").lower() == "true"
@@ -772,11 +772,20 @@ def _admin_ok(req):
         return True
     return bool(token) and token == ADMIN_TOKEN
 
+from werkzeug.exceptions import HTTPException
 
 @app.errorhandler(Exception)
 def _on_unhandled(e):
+    if isinstance(e, HTTPException):
+        # Giữ nguyên mã lỗi gốc (404, 405, 401…)
+        return e
     app.logger.exception("Unhandled error")
-    return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": False, "error": "internal_error"}), 500
+
+@app.errorhandler(404)
+def _on_404(e):
+    return jsonify({"ok": False, "error": "not_found"}), 404
+
 
 # --- admin endpoints (an toàn hơn) ---
 # ========= ADMIN ENDPOINTS =========
@@ -1823,6 +1832,11 @@ def answer_with_rag(user_id, user_question, channel=None):
 @app.get("/_ping")
 def _ping():
     return jsonify({"ok": True})
+
+@app.get("/")
+def index():
+    return "OK — Aloha Bot is running", 200
+
 
 # ========= WEBHOOK =========
 @app.route("/webhook", methods=["GET", "POST"])
